@@ -11,14 +11,41 @@ impl Module for ITransformer {
     }
 }
 
-struct Attention;
+struct Attention {
+    scale: f64,
+    norm: LayerNorm,
+    to_qkv: Linear,
+    to_value_residual_mix: Option<Linear>,
+    to_v_gates: Linear,
+    attend: Attend,
+    to_out: Linear,
+    dropout: Dropout,
+    learned_value_residual_mix: bool,
+}
+
+
 
 impl Attention {
-    fn new() -> Self {
-        Self
+    fn new(vb: &VarBuilder, dim: usize, dim_head: Option<usize>, heads: Option<usize>, drop_p: Option<f32>, is_flash: Option<bool>, learned_value_residual_mix: Option<bool>) -> Result<Self> {
+        let dim_head = dim_head.unwrap_or(32);
+        let heads = heads.unwrap_or(4);
+        let dim_inner = dim_head * heads; // hidden size
+        let scale = (dim_head as f64).sqrt();
+
+        Ok(Self {
+            scale,
+            norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("attn_layernorm"))?,
+            to_qkv:,
+            to_value_residual_mix:,
+            to_v_gates:,
+            attend: Attend::new(drop_p, None, None, is_flash, None, None)?,
+            to_out:,
+            dropout: Dropout::new(drop_p.unwrap_or(0.0)),
+            learned_value_residual_mix: learned_value_residual_mix.unwrap_or(false),
+        })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, value_residual: Option<&Tensor>) -> Result<Tensor> {
         todo!()
     }
 }
@@ -81,7 +108,7 @@ struct Attend {
 
 impl Attend {
     fn new(
-        dropout: Option<f32>,
+        drop_p: Option<f32>,
         heads: Option<usize>,
         scale: Option<f64>,
         is_flash: Option<bool>,
@@ -96,8 +123,8 @@ impl Attend {
 
         Ok(Self {
             scale,
-            drop_p: dropout.unwrap_or(0.0),
-            attn_dropout: Dropout::new(dropout.unwrap_or(0.)),
+            drop_p: drop_p.unwrap_or(0.0),
+            attn_dropout: Dropout::new(drop_p.unwrap_or(0.)),
             heads: heads.unwrap_or(8),
             is_flash: is_flash.unwrap_or(false),
             is_causal: is_causal.unwrap_or(false),
