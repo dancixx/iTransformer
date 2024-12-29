@@ -1,48 +1,122 @@
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, WithDType, D};
+use candle_ext::{TensorExt, F};
+use candle_nn::ops::softmax_last_dim;
 use candle_nn::{Dropout, Module};
 
-/// A transformer module.
 pub struct ITransformer;
 
 impl Module for ITransformer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        unimplemented!()
+        todo!()
     }
 }
 
-struct Attention {
-    scale: f32,
-    dropout: f32,
-    attn_dropout: Dropout,
-    heads: usize,
-    flash_attn: bool,
-    causal: bool,
-}
+struct Attention;
 
 impl Attention {
+    fn new() -> Self {
+        Self
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        todo!()
+    }
+}
+
+struct GEGLU;
+
+impl Module for GEGLU {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        todo!()
+    }
+}
+
+struct FeedForward;
+
+struct Attend {
+    scale: Option<f64>,
+    dropout: f32,
+    is_training: bool,
+    attn_dropout: Dropout,
+    heads: usize,
+    flash: bool,
+    causal: bool,
+    device: Device,
+}
+
+impl Attend {
     fn new(
         dropout: Option<f32>,
         heads: Option<usize>,
-        scale: Option<f32>,
-        flash_attn: Option<bool>,
+        scale: Option<f64>,
+        flash: Option<bool>,
         causal: Option<bool>,
-    ) -> Self {
-        Self {
-            scale: scale.unwrap_or(1.0),
+        is_training: Option<bool>,
+    ) -> Result<Self> {
+        let device = if cuda_is_available() {
+            Device::cuda_if_available(0)?
+        } else {
+            Device::Cpu
+        };
+
+        Ok(Self {
+            scale,
             dropout: dropout.unwrap_or(0.0),
-            attn_dropout: Dropout::new(dropout.unwrap_or(0.0)),
+            attn_dropout: Dropout::new(dropout.unwrap_or(0.)),
             heads: heads.unwrap_or(8),
-            flash_attn: flash_attn.unwrap_or(false),
+            flash: flash.unwrap_or(false),
             causal: causal.unwrap_or(false),
+            device,
+            is_training: is_training.unwrap_or(false),
+        })
+    }
+
+    fn flash_attn(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        F::scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            None,
+            Some(self.dropout),
+            Some(self.causal),
+            self.scale,
+        )
+    }
+
+    fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let scale = if let Some(scale) = self.scale {
+            scale
+        } else {
+            (q.dim(D::Minus1)? as f64).sqrt()
+        };
+
+        if self.flash {
+            return self.flash_attn(q, k, v);
         }
-    }
 
-    fn flash_attn() {
-        unimplemented!()
-    }
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let mut sim = (q.matmul(&k_t)? * scale)?;
 
-    fn forward() {
-        unimplemented!()
+        if self.causal {
+            let (i, j, dtype) = (sim.dim(D::Minus2)?, sim.dim(D::Minus1)?, sim.dtype());
+            // select the causal mask value based on the dtype
+            let mask_value = match dtype {
+                DType::F32 => f32::NEG_INFINITY as f64,
+                DType::F64 => f64::NEG_INFINITY,
+                _ => panic!("Unsupported dtype for causal mask"),
+            };
+            let casual_mask = Tensor::triu2(j - i + 1, DType::U8, &self.device)?;
+            sim = sim.masked_fill(&casual_mask, mask_value)?;
+        }
+
+        let attn = softmax_last_dim(&sim)?;
+        let attn = attn.to_dtype(q.dtype())?;
+        let attn = self.attn_dropout.forward(&attn, self.is_training)?;
+
+        let v_t = v.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn = attn.matmul(&v_t);
+
+        attn
     }
 }
 
@@ -88,11 +162,13 @@ impl RevIn {
     )> {
         assert_eq!(xs.dims()[1] == self.num_variants, true);
 
-        let last_dim = xs.dims().len() - 1;
-        let mean = xs.mean_keepdim(last_dim)?;
+        let mean = xs.mean_keepdim(D::Minus1)?;
         // Use biased variance instead of unbiased variance
         // let var = xs.var_keepdim(last_dim)?;
-        let biased_var = xs.broadcast_sub(&mean)?.powf(2.0)?.mean_keepdim(last_dim)?;
+        let biased_var = xs
+            .broadcast_sub(&mean)?
+            .powf(2.0)?
+            .mean_keepdim(D::Minus1)?;
         let var_rsqrt = biased_var.clamp(self.eps, f64::INFINITY)?.sqrt()?.recip()?;
         let instance_norm = xs.broadcast_sub(&mean)?.broadcast_mul(&var_rsqrt)?;
         let rescaled = (instance_norm

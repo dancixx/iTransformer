@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "anyhow"
+version = "1.0.95"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
+
+[[package]]
 name = "arbitrary"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -75,6 +81,17 @@ dependencies = [
  "ug",
  "yoke",
  "zip",
+]
+
+[[package]]
+name = "candle-ext"
+version = "0.1.7"
+source = "git+https://github.com/dancixx/candle-ext.git#098f4cad1ee48ab22a064b1cbe0b78ce741b0b25"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "num-traits",
 ]
 
 [[package]]
@@ -360,6 +377,7 @@ name = "iTransformer"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-ext",
  "candle-nn",
 ]
 
