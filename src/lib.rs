@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::Module;
+use candle_nn::{Dropout, Module};
 
 /// A transformer module.
 pub struct ITransformer;
@@ -10,7 +10,43 @@ impl Module for ITransformer {
     }
 }
 
-pub struct Statistics {
+struct Attention {
+    scale: f32,
+    dropout: f32,
+    attn_dropout: Dropout,
+    heads: usize,
+    flash_attn: bool,
+    causal: bool,
+}
+
+impl Attention {
+    fn new(
+        dropout: Option<f32>,
+        heads: Option<usize>,
+        scale: Option<f32>,
+        flash_attn: Option<bool>,
+        causal: Option<bool>,
+    ) -> Self {
+        Self {
+            scale: scale.unwrap_or(1.0),
+            dropout: dropout.unwrap_or(0.0),
+            attn_dropout: Dropout::new(dropout.unwrap_or(0.0)),
+            heads: heads.unwrap_or(8),
+            flash_attn: flash_attn.unwrap_or(false),
+            causal: causal.unwrap_or(false),
+        }
+    }
+
+    fn flash_attn() {
+        unimplemented!()
+    }
+
+    fn forward() {
+        unimplemented!()
+    }
+}
+
+struct Statistics {
     mean: Tensor,
     variance: Tensor,
     gamma: Tensor,
@@ -19,7 +55,7 @@ pub struct Statistics {
 
 /// A reversible instance normalization module.
 /// https://openreview.net/forum?id=cGDAkQo1C0p
-pub struct RevIn {
+struct RevIn {
     num_variants: usize,
     eps: f64,
     affine: bool,
@@ -28,7 +64,7 @@ pub struct RevIn {
 }
 
 impl RevIn {
-    pub fn new(num_variants: usize, affine: Option<bool>, eps: Option<f64>) -> Self {
+    fn new(num_variants: usize, affine: Option<bool>, eps: Option<f64>) -> Self {
         let gamma = Tensor::ones((num_variants, 1), DType::F64, &Device::Cpu).unwrap();
         let beta = Tensor::zeros((num_variants, 1), DType::F64, &Device::Cpu).unwrap();
 
@@ -41,7 +77,7 @@ impl RevIn {
         }
     }
 
-    pub fn forward(
+    fn forward(
         self,
         xs: &Tensor,
         return_statistics: Option<bool>,
