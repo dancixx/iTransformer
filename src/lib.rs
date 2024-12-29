@@ -1,7 +1,7 @@
 use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, WithDType, D};
 use candle_ext::{TensorExt, F};
 use candle_nn::ops::softmax_last_dim;
-use candle_nn::{Dropout, Module};
+use candle_nn::{layer_norm, linear, Dropout, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
 
 pub struct ITransformer;
 
@@ -27,20 +27,55 @@ struct GEGLU;
 
 impl Module for GEGLU {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        todo!()
+        let (x, gate) = xs.chunk2(D::Minus1)?;
+        let gate = gate.gelu()?;
+        x*gate
     }
 }
 
-struct FeedForward;
+struct FeedForward {
+    is_train: bool,
+    norm: LayerNorm,
+    linear1: Linear,
+    geglu: GEGLU,
+    dropout: Dropout,
+    linear2: Linear,
+}
+
+impl FeedForward {
+    fn new(vb: &VarBuilder, dim: usize, mult: usize, drop_p: Option<f32>, is_train: Option<bool>) -> Result<Self> {
+        let dim_inner = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as usize;
+
+        Ok(Self {
+            is_train: is_train.unwrap_or(false),
+            norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("ff_layernorm"))?,
+            linear1: linear(dim, dim_inner, vb.pp("ff_linear1"))?,
+            geglu: GEGLU,
+            dropout: Dropout::new(drop_p.unwrap_or(0.0)),
+            linear2: linear(dim_inner, dim, vb.pp("ff_linear2"))?,
+        })
+    }
+}
+
+impl Module for FeedForward {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.norm.forward(xs)?;
+        let xs = self.linear1.forward(&xs)?;
+        let xs = self.geglu.forward(&xs)?;
+        let xs = self.dropout.forward(&xs, self.is_train)?;
+        let xs = self.linear2.forward(&xs)?;
+        Ok(xs)
+    }
+}
 
 struct Attend {
     scale: Option<f64>,
-    dropout: f32,
-    is_training: bool,
+    drop_p: f32,
+    is_train: bool,
     attn_dropout: Dropout,
     heads: usize,
-    flash: bool,
-    causal: bool,
+    is_flash: bool,
+    is_causal: bool,
     device: Device,
 }
 
@@ -49,9 +84,9 @@ impl Attend {
         dropout: Option<f32>,
         heads: Option<usize>,
         scale: Option<f64>,
-        flash: Option<bool>,
-        causal: Option<bool>,
-        is_training: Option<bool>,
+        is_flash: Option<bool>,
+        is_causal: Option<bool>,
+        is_train: Option<bool>,
     ) -> Result<Self> {
         let device = if cuda_is_available() {
             Device::cuda_if_available(0)?
@@ -61,13 +96,13 @@ impl Attend {
 
         Ok(Self {
             scale,
-            dropout: dropout.unwrap_or(0.0),
+            drop_p: dropout.unwrap_or(0.0),
             attn_dropout: Dropout::new(dropout.unwrap_or(0.)),
             heads: heads.unwrap_or(8),
-            flash: flash.unwrap_or(false),
-            causal: causal.unwrap_or(false),
+            is_flash: is_flash.unwrap_or(false),
+            is_causal: is_causal.unwrap_or(false),
             device,
-            is_training: is_training.unwrap_or(false),
+            is_train: is_train.unwrap_or(false),
         })
     }
 
@@ -77,8 +112,8 @@ impl Attend {
             k,
             v,
             None,
-            Some(self.dropout),
-            Some(self.causal),
+            Some(self.drop_p),
+            Some(self.is_causal),
             self.scale,
         )
     }
@@ -90,14 +125,14 @@ impl Attend {
             (q.dim(D::Minus1)? as f64).sqrt()
         };
 
-        if self.flash {
+        if self.is_flash {
             return self.flash_attn(q, k, v);
         }
 
         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let mut sim = (q.matmul(&k_t)? * scale)?;
 
-        if self.causal {
+        if self.is_causal {
             let (i, j, dtype) = (sim.dim(D::Minus2)?, sim.dim(D::Minus1)?, sim.dtype());
             // select the causal mask value based on the dtype
             let mask_value = match dtype {
@@ -111,7 +146,7 @@ impl Attend {
 
         let attn = softmax_last_dim(&sim)?;
         let attn = attn.to_dtype(q.dtype())?;
-        let attn = self.attn_dropout.forward(&attn, self.is_training)?;
+        let attn = self.attn_dropout.forward(&attn, self.is_train)?;
 
         let v_t = v.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let attn = attn.matmul(&v_t);
