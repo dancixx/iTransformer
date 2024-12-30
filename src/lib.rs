@@ -2,13 +2,269 @@ use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, WithD
 use candle_einops::einops;
 use candle_ext::{TensorExt, F};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
-use candle_nn::{layer_norm, linear, Dropout, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
+use candle_nn::{
+    layer_norm, linear, Dropout, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder,
+};
+use either::Either;
 
-pub struct ITransformer;
+pub struct ITransformer {
+    num_variates: usize,
+    lookback_len: usize,
+    pred_length: Vec<usize>,
+    num_tokens_per_variate: usize,
+    mem_tokens: Option<Tensor>,
+    reversible_instance_norm: Option<RevIn>,
+    // expand_streams: HyperStream,
+    // reduce_streams: HyperStream,
+    layers: Vec<(Attention, FeedForward)>,
+    mlp_in: MlpIn,
+    pred_heads: Vec<PredHead>,
+}
 
-impl Module for ITransformer {
+impl ITransformer {
+    pub fn new(
+        vb: &VarBuilder,
+        num_variates: usize,
+        lookback_len: usize,
+        depth: usize,
+        dim: usize,
+        num_tokens_per_variate: Option<usize>,
+        pred_length: Vec<usize>,
+        dim_head: Option<usize>,
+        heads: Option<usize>,
+        attn_dropout: Option<f32>,
+        ff_mult: Option<usize>,
+        ff_dropout: Option<f32>,
+        num_mem_tokens: Option<usize>,
+        // num_residual_streams: Option<usize>,
+        use_reversible_instance_norm: Option<bool>,
+        reversible_instance_norm_affine: Option<bool>,
+        flash_attn: bool,
+        device: &Device,
+    ) -> Result<Self> {
+        let num_tokens_per_variate = num_tokens_per_variate.unwrap_or(1);
+        let dim_head = dim_head.unwrap_or(32);
+        let heads = heads.unwrap_or(4);
+        let attn_dropout = attn_dropout.unwrap_or(0.0);
+        let ff_mult = ff_mult.unwrap_or(4);
+        let ff_dropout = ff_dropout.unwrap_or(0.0);
+        let num_mem_tokens = num_mem_tokens.unwrap_or(4);
+        // let num_residual_streams = num_residual_streams.unwrap_or(4);
+        let use_reversible_instance_norm = use_reversible_instance_norm.unwrap_or(false);
+        let reversible_instance_norm_affine = reversible_instance_norm_affine.unwrap_or(true);
+
+        let mem_tokens = if num_mem_tokens > 0 {
+            Some(Tensor::randn(0.0, 1.0, (num_mem_tokens, dim), device)?)
+        } else {
+            None
+        };
+
+        let reversible_instance_norm = if use_reversible_instance_norm {
+            Some(RevIn::new(
+                num_variates,
+                Some(reversible_instance_norm_affine),
+                None,
+            ))
+        } else {
+            None
+        };
+
+        let mut layers = Vec::with_capacity(depth);
+
+        for idx in 0..depth {
+            let attn = Attention::new(
+                vb,
+                Some(idx),
+                dim,
+                Some(dim_head),
+                Some(heads),
+                Some(attn_dropout),
+                Some(flash_attn),
+                None,
+                None,
+            )?;
+            let ff = FeedForward::new(vb, Some(idx), dim, ff_mult, Some(ff_dropout), None)?;
+            layers.push((attn, ff));
+        }
+
+        let mlp_in = MlpIn::new(
+            &vb,
+            lookback_len,
+            dim * num_tokens_per_variate,
+            num_tokens_per_variate,
+        )?;
+        let mut pred_heads = Vec::with_capacity(pred_length.len());
+        for &pl in &pred_length {
+            pred_heads.push(PredHead::new(vb, dim, pl, num_tokens_per_variate)?);
+        }
+
+        Ok(Self {
+            num_variates,
+            lookback_len,
+            pred_length,
+            num_tokens_per_variate,
+            mem_tokens,
+            reversible_instance_norm,
+            mlp_in,
+            pred_heads,
+            layers,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        targets: Option<&Vec<Tensor>>,
+    ) -> Result<Either<Vec<(usize, Tensor)>, f64>> {
+        /// einstein notation
+        /// b: batch size
+        /// n: time
+        /// v: variate
+        /// t: num tokens per variate
+        let t = self.num_tokens_per_variate;
+        let has_mem = self.mem_tokens.is_some();
+        assert_eq!(xs.dims()[1..], [self.lookback_len, self.num_variates]);
+
+        // einsum 'b n v -> b v n'
+        let xs = einops!("b n v -> b v n", &xs);
+        let mut revin: Option<RevInResult> = None;
+
+        if let Some(ref reversible_instance_norm) = &self.reversible_instance_norm {
+            let result = reversible_instance_norm.to_owned();
+            let result = result.forward(&xs, Some(false));
+            revin = Some(result);
+        };
+
+        let (xs, reverse_fn, ..) = revin.unwrap()?;
+        let mut xs = self.mlp_in.forward(&xs)?;
+        let mut mem_ps = 0;
+
+        if has_mem {
+            let m = self.mem_tokens.as_ref().unwrap().dim(0)?;
+            let d = self.mem_tokens.as_ref().unwrap().dim(1)?;
+            let repeated =
+                self.mem_tokens
+                    .as_ref()
+                    .unwrap()
+                    .unsqueeze(0)?
+                    .repeat(&[xs.dim(0)?, m, d])?;
+            mem_ps = repeated.dim(1)?;
+            xs = Tensor::cat(&[repeated, xs.clone()], 1)?;
+        }
+
+        for (attn, ff) in &self.layers {
+            let (attn_out, cache_v) = attn.forward(&xs, self.mem_tokens.as_ref())?;
+            let xs_ = &xs + attn_out;
+            let xs_ = ff.forward(&xs_?)?;
+            xs = xs_
+        }
+
+        if has_mem {
+            let b = xs.dim(1)?;
+            let total_tokens = xs.dim(1)?;
+            let d = xs.dim(2)?;
+            xs = xs.narrow(1, mem_ps, total_tokens - mem_ps)?;
+        }
+
+        if self.reversible_instance_norm.is_some() {
+            // einops 'b (n t) d -> t b n d
+            let xs_ = xs
+                .reshape(&[t, xs.dim(0)?, xs.dim(1)? / t, xs.dim(2)?])?
+                .transpose(0, 1)?;
+            let xs_ = reverse_fn(&xs_)?;
+            // einops 't b n d -> b (n t) d'
+            let xs_ = xs_
+                .transpose(0, 1)?
+                .reshape(&[xs.dim(1)?, xs.dim(2)? * t, xs.dim(3)?])?;
+            xs = xs_
+        }
+
+        let mut preds = Vec::with_capacity(self.pred_heads.len());
+        for pred_head in self.pred_heads {
+            let pred = pred_head.forward(&xs)?;
+            preds.push(pred);
+        }
+
+        if let Some(targets) = targets {
+            let mut mse_loss = 0.0;
+            for (target, pred) in targets.iter().zip(&preds) {
+                assert_eq!(target.dims(), pred.dims());
+                mse_loss = mse_loss + (target - pred)?.powf(2.0).sum()?;
+            }
+
+            Ok(Either::Right(mse_loss))
+        } else {
+            let result = self.pred_length.clone();
+            let result = result.into_iter().zip(preds).collect::<Vec<_>>();
+            Ok(Either::Left(result))
+        }
+    }
+}
+
+pub struct PredHead {
+    num_tokens_per_variate: usize,
+    linear: Linear,
+}
+
+impl PredHead {
+    fn new(
+        vb: &VarBuilder,
+        dim: usize,
+        one_pred_length: usize,
+        num_tokens_per_variate: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            num_tokens_per_variate,
+            linear: linear(
+                dim * num_tokens_per_variate,
+                one_pred_length,
+                vb.pp("head_linear"),
+            )?,
+        })
+    }
+}
+
+impl Module for PredHead {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        todo!()
+        let n = self.num_tokens_per_variate;
+        // einsum 'b (v n) d -> b v (n d)', n = num_tokens_per_variate
+        let xs = einops!("b (v {n}) d -> b v ({n} d)", &xs);
+        let xs = self.linear.forward(&xs)?;
+        // einsum 'b v n -> b n v'
+        let xs = einops!("b v n -> b n v", &xs);
+        Ok(xs)
+    }
+}
+
+struct MlpIn {
+    num_tokens_per_variate: usize,
+    linear: Linear,
+    layer_norm: LayerNorm,
+}
+
+impl MlpIn {
+    fn new(
+        vb: &VarBuilder,
+        dim: usize,
+        hidden_size: usize,
+        num_tokens_per_variate: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            num_tokens_per_variate,
+            linear: linear(dim, hidden_size, vb.pp("mlp_in_linear"))?,
+            layer_norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("mlp_in_layernorm"))?,
+        })
+    }
+}
+
+impl Module for MlpIn {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.linear.forward(&xs)?;
+        // einsum 'b v (n d) -> b (v n) d', n = num_tokens_per_variate
+        let n = self.num_tokens_per_variate;
+        let xs = einops!("b v ({n} d) -> b (v {n}) d", &xs);
+        let xs = self.layer_norm.forward(&xs)?;
+        Ok(xs)
     }
 }
 
@@ -19,7 +275,10 @@ struct ToQKV {
 
 impl ToQKV {
     fn new(vb: &VarBuilder, dim: usize, hidden_size: usize, heads: usize) -> Result<Self> {
-        Ok(Self { linear: linear(dim, hidden_size * 3, vb.pp("attn_to_qkv"))?, heads })
+        Ok(Self {
+            linear: linear(dim, hidden_size * 3, vb.pp("attn_to_qkv"))?,
+            heads,
+        })
     }
 }
 
@@ -42,12 +301,14 @@ impl Module for ToQKV {
 }
 
 pub struct ToValueResidualMix {
-    linear: Linear
+    linear: Linear,
 }
 
 impl ToValueResidualMix {
     fn new(vb: &VarBuilder, dim: usize, heads: usize) -> Result<Self> {
-        Ok(Self { linear: linear(dim, heads, vb.pp("attn_to_value_residual_mix"))? })
+        Ok(Self {
+            linear: linear(dim, heads, vb.pp("attn_to_value_residual_mix"))?,
+        })
     }
 }
 
@@ -65,12 +326,15 @@ impl Module for ToValueResidualMix {
 
 struct ToVGates {
     linear: Linear,
-    heads:  usize,
+    heads: usize,
 }
 
 impl ToVGates {
     fn new(vb: &VarBuilder, dim: usize, heads: usize) -> Result<Self> {
-        Ok(Self { linear: linear(dim, heads, vb.pp("attn_to_v_gates"))?, heads })
+        Ok(Self {
+            linear: linear(dim, heads, vb.pp("attn_to_v_gates"))?,
+            heads,
+        })
     }
 }
 
@@ -94,7 +358,14 @@ pub struct ToOut {
 }
 
 impl ToOut {
-    fn new(vb: &VarBuilder, dim: usize, heads: usize, dim_head: usize, drop_p: f32, is_train: Option<bool>) -> Result<Self> {
+    fn new(
+        vb: &VarBuilder,
+        dim: usize,
+        heads: usize,
+        dim_head: usize,
+        drop_p: f32,
+        is_train: Option<bool>,
+    ) -> Result<Self> {
         Ok(Self {
             linear: linear(dim_head * heads, dim, vb.pp("attn_to_out"))?,
             dropout: Dropout::new(drop_p),
@@ -116,7 +387,7 @@ impl Module for ToOut {
 
 struct Attention {
     scale: f64,
-    norm: LayerNorm,
+    layer_norm: LayerNorm,
     to_qkv: ToQKV,
     to_value_residual_mix: Option<ToValueResidualMix>,
     to_v_gates: ToVGates,
@@ -127,21 +398,38 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(vb: &VarBuilder, dim: usize, dim_head: Option<usize>, heads: Option<usize>, drop_p: Option<f32>, is_flash: Option<bool>, is_train: Option<bool>, learned_value_residual_mix: Option<bool>) -> Result<Self> {
+    fn new(
+        vb: &VarBuilder,
+        idx: Option<usize>,
+        dim: usize,
+        dim_head: Option<usize>,
+        heads: Option<usize>,
+        drop_p: Option<f32>,
+        is_flash: Option<bool>,
+        is_train: Option<bool>,
+        learned_value_residual_mix: Option<bool>,
+    ) -> Result<Self> {
         let dim_head = dim_head.unwrap_or(32);
         let heads = heads.unwrap_or(4);
         let scale = (dim_head as f64).sqrt();
 
+        let layer_norm = layer_norm(
+            dim,
+            LayerNormConfig::default(),
+            vb.pp(format!("attn_{}_layernorm", idx.unwrap_or(0))),
+        )?;
         let to_qkv = ToQKV::new(vb, dim, dim_head, heads)?;
         let to_value_residual_mix = if learned_value_residual_mix.unwrap_or(false) {
             Some(ToValueResidualMix::new(vb, dim, heads)?)
-        } else { None };
+        } else {
+            None
+        };
         let to_v_gates = ToVGates::new(vb, dim, heads)?;
         let to_out = ToOut::new(vb, dim, heads, dim_head, drop_p.unwrap_or(0.0), is_train)?;
 
         Ok(Self {
             scale,
-            norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("attn_layernorm"))?,
+            layer_norm,
             to_qkv,
             to_value_residual_mix,
             to_v_gates,
@@ -153,7 +441,7 @@ impl Attention {
     }
 
     fn forward(&self, xs: &Tensor, value_residual: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
-        let xs = self.norm.forward(xs)?;
+        let xs = self.layer_norm.forward(xs)?;
         let (q, k, mut v) = self.to_qkv.forward(&xs)?;
         let cache_v = v.clone();
 
@@ -181,13 +469,13 @@ impl Module for GEGLU {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (x, gate) = xs.chunk2(D::Minus1)?;
         let gate = gate.gelu()?;
-        x*gate
+        x * gate
     }
 }
 
 struct FeedForward {
     is_train: bool,
-    norm: LayerNorm,
+    layer_norm: LayerNorm,
     linear1: Linear,
     geglu: GEGLU,
     dropout: Dropout,
@@ -195,23 +483,46 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn new(vb: &VarBuilder, dim: usize, mult: usize, drop_p: Option<f32>, is_train: Option<bool>) -> Result<Self> {
+    fn new(
+        vb: &VarBuilder,
+        idx: Option<usize>,
+        dim: usize,
+        mult: usize,
+        drop_p: Option<f32>,
+        is_train: Option<bool>,
+    ) -> Result<Self> {
         let hidden_size = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as usize;
+
+        let layer_norm = layer_norm(
+            dim,
+            LayerNormConfig::default(),
+            vb.pp(format!("ff_{}_layer_norm", idx.unwrap_or(0))),
+        )?;
+        let linear1 = linear(
+            dim,
+            hidden_size,
+            vb.pp(format!("ff_{}_linear1", idx.unwrap_or(0))),
+        )?;
+        let linear2 = linear(
+            hidden_size,
+            dim,
+            vb.pp(format!("ff_{}_linear2", idx.unwrap_or(0)))?,
+        )?;
 
         Ok(Self {
             is_train: is_train.unwrap_or(false),
-            norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("ff_layernorm"))?,
-            linear1: linear(dim, hidden_size, vb.pp("ff_linear1"))?,
+            layer_norm,
+            linear1,
             geglu: GEGLU,
             dropout: Dropout::new(drop_p.unwrap_or(0.0)),
-            linear2: linear(hidden_size, dim, vb.pp("ff_linear2"))?,
+            linear2,
         })
     }
 }
 
 impl Module for FeedForward {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = self.norm.forward(xs)?;
+        let xs = self.layer_norm.forward(xs)?;
         let xs = self.linear1.forward(&xs)?;
         let xs = self.geglu.forward(&xs)?;
         let xs = self.dropout.forward(&xs, self.is_train)?;
@@ -317,6 +628,7 @@ struct Statistics {
 
 /// A reversible instance normalization module.
 /// https://openreview.net/forum?id=cGDAkQo1C0p
+#[derive(Clone)]
 struct RevIn {
     num_variants: usize,
     eps: f64,
@@ -324,6 +636,12 @@ struct RevIn {
     gamma: Tensor,
     beta: Tensor,
 }
+
+type RevInResult = Result<(
+    Tensor,
+    Box<dyn FnOnce(&Tensor) -> Result<Tensor>>,
+    Option<Statistics>,
+)>;
 
 impl RevIn {
     fn new(num_variants: usize, affine: Option<bool>, eps: Option<f64>) -> Self {
@@ -339,15 +657,7 @@ impl RevIn {
         }
     }
 
-    fn forward(
-        self,
-        xs: &Tensor,
-        return_statistics: Option<bool>,
-    ) -> Result<(
-        Tensor,
-        Box<dyn FnOnce(&Tensor) -> Result<Tensor>>,
-        Option<Statistics>,
-    )> {
+    fn forward(self, xs: &Tensor, return_statistics: Option<bool>) -> RevInResult {
         assert_eq!(xs.dims()[1] == self.num_variants, true);
 
         let mean = xs.mean_keepdim(D::Minus1)?;
