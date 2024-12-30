@@ -1,4 +1,4 @@
-use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, WithDType, D};
+use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, D};
 use candle_einops::einops;
 use candle_ext::{TensorExt, F};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
@@ -116,11 +116,11 @@ impl ITransformer {
         xs: &Tensor,
         targets: Option<&Vec<Tensor>>,
     ) -> Result<Either<Vec<(usize, Tensor)>, f64>> {
-        /// einstein notation
-        /// b: batch size
-        /// n: time
-        /// v: variate
-        /// t: num tokens per variate
+        // einstein notation
+        // b: batch size
+        // n: time
+        // v: variate
+        // t: num tokens per variate
         let t = self.num_tokens_per_variate;
         let has_mem = self.mem_tokens.is_some();
         assert_eq!(xs.dims()[1..], [self.lookback_len, self.num_variates]);
@@ -153,7 +153,7 @@ impl ITransformer {
         }
 
         for (attn, ff) in &self.layers {
-            let (attn_out, cache_v) = attn.forward(&xs, self.mem_tokens.as_ref())?;
+            let (attn_out, ..) = attn.forward(&xs, self.mem_tokens.as_ref())?;
             let xs_ = &xs + attn_out;
             let xs_ = ff.forward(&xs_?)?;
             xs = xs_
@@ -180,7 +180,7 @@ impl ITransformer {
         }
 
         let mut preds = Vec::with_capacity(self.pred_heads.len());
-        for pred_head in self.pred_heads {
+        for pred_head in &self.pred_heads {
             let pred = pred_head.forward(&xs)?;
             preds.push(pred);
         }
@@ -189,7 +189,7 @@ impl ITransformer {
             let mut mse_loss = 0.0;
             for (target, pred) in targets.iter().zip(&preds) {
                 assert_eq!(target.dims(), pred.dims());
-                mse_loss = mse_loss + (target - pred)?.powf(2.0).sum()?;
+                // mse_loss = mse_loss + (target - pred)?.powf(2.0)?.into_iter().sum()?;
             }
 
             Ok(Either::Right(mse_loss))
@@ -280,9 +280,7 @@ impl ToQKV {
             heads,
         })
     }
-}
 
-impl Module for ToQKV {
     fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let xs = self.linear.forward(xs)?;
         // einsum: rearrange 'b n (qkv h d) -> qkv b h n d', where qkv = 3 & h = heads
@@ -300,6 +298,7 @@ impl Module for ToQKV {
     }
 }
 
+#[derive(Clone)]
 pub struct ToValueResidualMix {
     linear: Linear,
 }
@@ -444,14 +443,13 @@ impl Attention {
         let xs = self.layer_norm.forward(xs)?;
         let (q, k, mut v) = self.to_qkv.forward(&xs)?;
         let cache_v = v.clone();
-
         let lerp = |start: &Tensor, end: &Tensor, weight: &Tensor| -> Result<Tensor> {
             (start * (1.0 - weight))? + (end * weight)?
         };
 
         if let Some(to_value_residual_mix) = &self.to_value_residual_mix {
             if let Some(value_residual) = value_residual {
-                let mix = self.to_value_residual_mix.forward(&xs)?;
+                let mix = self.to_value_residual_mix.as_ref().unwrap().forward(&xs)?;
                 v = lerp(&v, value_residual, &mix)?;
             }
         }
@@ -506,7 +504,7 @@ impl FeedForward {
         let linear2 = linear(
             hidden_size,
             dim,
-            vb.pp(format!("ff_{}_linear2", idx.unwrap_or(0)))?,
+            vb.pp(format!("ff_{}_linear2", idx.unwrap_or(0))),
         )?;
 
         Ok(Self {
@@ -705,8 +703,9 @@ impl RevIn {
 
 #[cfg(test)]
 mod tests {
-    use crate::RevIn;
-    use candle_core::{Device, Tensor};
+    use crate::{ITransformer, RevIn};
+    use candle_core::{DType, Device, Result, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
 
     #[test]
     fn test_rev_in_v1() {
@@ -774,5 +773,36 @@ mod tests {
             .collect::<Vec<Vec<Vec<f64>>>>();
 
         assert_eq!(out, xs);
+    }
+
+    #[test]
+    fn test_itransformer() -> Result<()> {
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F64, &Device::Cpu);
+        let model = ITransformer::new(
+            &vb,
+            137,
+            96,
+            6,
+            256,
+            Some(1),
+            vec![12, 24, 36, 48],
+            Some(64),
+            Some(8),
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            false,
+            &Device::Cpu,
+        )?;
+
+        let time_series = Tensor::randn(0., 1., (2, 96, 137), &Device::Cpu)?;
+        let preds = model.forward(&time_series, None)?;
+
+        println!("{:?}", preds);
+
+        Ok(())
     }
 }
