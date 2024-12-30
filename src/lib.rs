@@ -1,6 +1,7 @@
 use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, WithDType, D};
+use candle_einops::einops;
 use candle_ext::{TensorExt, F};
-use candle_nn::ops::softmax_last_dim;
+use candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_nn::{layer_norm, linear, Dropout, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
 
 pub struct ITransformer;
@@ -11,42 +12,166 @@ impl Module for ITransformer {
     }
 }
 
+struct ToQKV {
+    linear: Linear,
+    heads: usize,
+}
+
+impl ToQKV {
+    fn new(vb: &VarBuilder, dim: usize, hidden_size: usize, heads: usize) -> Result<Self> {
+        Ok(Self { linear: linear(dim, hidden_size * 3, vb.pp("attn_to_qkv"))?, heads })
+    }
+}
+
+impl Module for ToQKV {
+    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let xs = self.linear.forward(xs)?;
+        // einsum: rearrange 'b n (qkv h d) -> qkv b h n d', where qkv = 3 & h = heads
+        // [b, n, 3 * heads * dim_head] -> [b, n, 3, heads, dim_head]
+        let (h, qkv) = (self.heads, 3);
+        let xs = einops!("b n ({qkv} {h} d) -> {qkv} b {h} n d", &xs);
+
+        // chunk qkv into q, k, v
+        let chunks = xs.chunk(3, 0)?;
+        let q = chunks[0].contiguous()?;
+        let k = chunks[1].contiguous()?;
+        let v = chunks[2].contiguous()?;
+
+        Ok((q, k, v))
+    }
+}
+
+pub struct ToValueResidualMix {
+    linear: Linear
+}
+
+impl ToValueResidualMix {
+    fn new(vb: &VarBuilder, dim: usize, heads: usize) -> Result<Self> {
+        Ok(Self { linear: linear(dim, heads, vb.pp("attn_to_value_residual_mix"))? })
+    }
+}
+
+impl Module for ToValueResidualMix {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.linear.forward(&xs)?;
+        let xs = sigmoid(&xs)?;
+
+        // einsum: 'b n h -> b h n 1'
+        let xs = einops!("b n h -> b h n 1", &xs);
+
+        Ok(xs)
+    }
+}
+
+struct ToVGates {
+    linear: Linear,
+    heads:  usize,
+}
+
+impl ToVGates {
+    fn new(vb: &VarBuilder, dim: usize, heads: usize) -> Result<Self> {
+        Ok(Self { linear: linear(dim, heads, vb.pp("attn_to_v_gates"))?, heads })
+    }
+}
+
+impl Module for ToVGates {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.linear.forward(&xs)?;
+        let xs = sigmoid(&xs)?;
+
+        // einsum: 'b n h -> b h n 1'
+        let h = self.heads;
+        let xs = einops!("b n h -> b {h} n 1", &xs);
+
+        Ok(xs)
+    }
+}
+
+pub struct ToOut {
+    linear: Linear,
+    dropout: Dropout,
+    is_train: bool,
+}
+
+impl ToOut {
+    fn new(vb: &VarBuilder, dim: usize, heads: usize, dim_head: usize, drop_p: f32, is_train: Option<bool>) -> Result<Self> {
+        Ok(Self {
+            linear: linear(dim_head * heads, dim, vb.pp("attn_to_out"))?,
+            dropout: Dropout::new(drop_p),
+            is_train: is_train.unwrap_or(false),
+        })
+    }
+}
+
+impl Module for ToOut {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // einsum 'b n h d -> b n (h d)'
+        let xs = einops!("b n h d -> b n (h d)", &xs);
+        let xs = self.linear.forward(&xs)?;
+        let xs = self.dropout.forward(&xs, self.is_train)?;
+
+        Ok(xs)
+    }
+}
+
 struct Attention {
     scale: f64,
     norm: LayerNorm,
-    to_qkv: Linear,
-    to_value_residual_mix: Option<Linear>,
-    to_v_gates: Linear,
+    to_qkv: ToQKV,
+    to_value_residual_mix: Option<ToValueResidualMix>,
+    to_v_gates: ToVGates,
     attend: Attend,
-    to_out: Linear,
+    to_out: ToOut,
     dropout: Dropout,
     learned_value_residual_mix: bool,
 }
 
-
-
 impl Attention {
-    fn new(vb: &VarBuilder, dim: usize, dim_head: Option<usize>, heads: Option<usize>, drop_p: Option<f32>, is_flash: Option<bool>, learned_value_residual_mix: Option<bool>) -> Result<Self> {
+    fn new(vb: &VarBuilder, dim: usize, dim_head: Option<usize>, heads: Option<usize>, drop_p: Option<f32>, is_flash: Option<bool>, is_train: Option<bool>, learned_value_residual_mix: Option<bool>) -> Result<Self> {
         let dim_head = dim_head.unwrap_or(32);
         let heads = heads.unwrap_or(4);
-        let dim_inner = dim_head * heads; // hidden size
         let scale = (dim_head as f64).sqrt();
+
+        let to_qkv = ToQKV::new(vb, dim, dim_head, heads)?;
+        let to_value_residual_mix = if learned_value_residual_mix.unwrap_or(false) {
+            Some(ToValueResidualMix::new(vb, dim, heads)?)
+        } else { None };
+        let to_v_gates = ToVGates::new(vb, dim, heads)?;
+        let to_out = ToOut::new(vb, dim, heads, dim_head, drop_p.unwrap_or(0.0), is_train)?;
 
         Ok(Self {
             scale,
             norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("attn_layernorm"))?,
-            to_qkv:,
-            to_value_residual_mix:,
-            to_v_gates:,
+            to_qkv,
+            to_value_residual_mix,
+            to_v_gates,
             attend: Attend::new(drop_p, None, None, is_flash, None, None)?,
-            to_out:,
+            to_out,
             dropout: Dropout::new(drop_p.unwrap_or(0.0)),
             learned_value_residual_mix: learned_value_residual_mix.unwrap_or(false),
         })
     }
 
-    fn forward(&self, xs: &Tensor, value_residual: Option<&Tensor>) -> Result<Tensor> {
-        todo!()
+    fn forward(&self, xs: &Tensor, value_residual: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+        let xs = self.norm.forward(xs)?;
+        let (q, k, mut v) = self.to_qkv.forward(&xs)?;
+        let cache_v = v.clone();
+
+        let lerp = |start: &Tensor, end: &Tensor, weight: &Tensor| -> Result<Tensor> {
+            (start * (1.0 - weight))? + (end * weight)?
+        };
+
+        if let Some(to_value_residual_mix) = &self.to_value_residual_mix {
+            if let Some(value_residual) = value_residual {
+                let mix = self.to_value_residual_mix.forward(&xs)?;
+                v = lerp(&v, value_residual, &mix)?;
+            }
+        }
+
+        let out = self.attend.forward(&q, &k, &v)?;
+        let out = self.to_out.forward(&out)?;
+
+        Ok((out, cache_v))
     }
 }
 
@@ -71,15 +196,15 @@ struct FeedForward {
 
 impl FeedForward {
     fn new(vb: &VarBuilder, dim: usize, mult: usize, drop_p: Option<f32>, is_train: Option<bool>) -> Result<Self> {
-        let dim_inner = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as usize;
+        let hidden_size = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as usize;
 
         Ok(Self {
             is_train: is_train.unwrap_or(false),
             norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("ff_layernorm"))?,
-            linear1: linear(dim, dim_inner, vb.pp("ff_linear1"))?,
+            linear1: linear(dim, hidden_size, vb.pp("ff_linear1"))?,
             geglu: GEGLU,
             dropout: Dropout::new(drop_p.unwrap_or(0.0)),
-            linear2: linear(dim_inner, dim, vb.pp("ff_linear2"))?,
+            linear2: linear(hidden_size, dim, vb.pp("ff_linear2"))?,
         })
     }
 }
@@ -156,6 +281,7 @@ impl Attend {
             return self.flash_attn(q, k, v);
         }
 
+        // einsum('b h i d, b h j d -> b h i j', q, k)
         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let mut sim = (q.matmul(&k_t)? * scale)?;
 

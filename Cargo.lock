@@ -84,6 +84,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-einops"
+version = "0.1.2"
+source = "git+https://github.com/dancixx/candle-einops.git#661054353d11b8b0a6dc1acb1351bc5bffaab410"
+dependencies = [
+ "candle-core",
+ "candle-einops-macros",
+]
+
+[[package]]
+name = "candle-einops-macros"
+version = "0.1.2"
+source = "git+https://github.com/dancixx/candle-einops.git#661054353d11b8b0a6dc1acb1351bc5bffaab410"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "candle-ext"
 version = "0.1.7"
 source = "git+https://github.com/dancixx/candle-ext.git#098f4cad1ee48ab22a064b1cbe0b78ce741b0b25"
@@ -377,6 +396,7 @@ name = "iTransformer"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-einops",
  "candle-ext",
  "candle-nn",
 ]
