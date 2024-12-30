@@ -1,5 +1,4 @@
 use candle_core::{utils::cuda_is_available, DType, Device, Result, Tensor, D};
-use candle_einops::einops;
 use candle_ext::{TensorExt, F};
 use candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_nn::{
@@ -94,8 +93,14 @@ impl ITransformer {
             num_tokens_per_variate,
         )?;
         let mut pred_heads = Vec::with_capacity(pred_length.len());
-        for &pl in &pred_length {
-            pred_heads.push(PredHead::new(vb, dim, pl, num_tokens_per_variate)?);
+        for (idx, pl) in pred_length.iter().enumerate() {
+            pred_heads.push(PredHead::new(
+                vb,
+                Some(idx),
+                dim,
+                *pl,
+                num_tokens_per_variate,
+            )?);
         }
 
         Ok(Self {
@@ -126,7 +131,7 @@ impl ITransformer {
         assert_eq!(xs.dims()[1..], [self.lookback_len, self.num_variates]);
 
         // einsum 'b n v -> b v n'
-        let xs = einops!("b n v -> b v n", &xs);
+        let xs = xs.transpose(1, 2)?;
         let mut revin: Option<RevInResult> = None;
 
         if let Some(ref reversible_instance_norm) = &self.reversible_instance_norm {
@@ -209,6 +214,7 @@ pub struct PredHead {
 impl PredHead {
     fn new(
         vb: &VarBuilder,
+        idx: Option<usize>,
         dim: usize,
         one_pred_length: usize,
         num_tokens_per_variate: usize,
@@ -218,7 +224,7 @@ impl PredHead {
             linear: linear(
                 dim * num_tokens_per_variate,
                 one_pred_length,
-                vb.pp("head_linear"),
+                vb.pp(format!("head_{}_linear", idx.unwrap_or(0))),
             )?,
         })
     }
@@ -227,11 +233,14 @@ impl PredHead {
 impl Module for PredHead {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let n = self.num_tokens_per_variate;
+        let b = xs.dim(0)?;
+        let v = xs.dim(1)?;
+        let d = xs.dim(2)?;
         // einsum 'b (v n) d -> b v (n d)', n = num_tokens_per_variate
-        let xs = einops!("b (v {n}) d -> b v ({n} d)", &xs);
+        let xs = xs.reshape(&[b, v, n * d])?;
         let xs = self.linear.forward(&xs)?;
         // einsum 'b v n -> b n v'
-        let xs = einops!("b v n -> b n v", &xs);
+        let xs = xs.transpose(1, 2)?;
         Ok(xs)
     }
 }
@@ -262,7 +271,11 @@ impl Module for MlpIn {
         let xs = self.linear.forward(&xs)?;
         // einsum 'b v (n d) -> b (v n) d', n = num_tokens_per_variate
         let n = self.num_tokens_per_variate;
-        let xs = einops!("b v ({n} d) -> b (v {n}) d", &xs);
+        let b = xs.dim(0)?;
+        let v = xs.dim(1)?;
+        let nd = xs.dim(2)?;
+        let d = nd / n;
+        let xs = xs.reshape(&[b, v * n, d])?;
         let xs = self.layer_norm.forward(&xs)?;
         Ok(xs)
     }
@@ -286,10 +299,15 @@ impl ToQKV {
         // einsum: rearrange 'b n (qkv h d) -> qkv b h n d', where qkv = 3 & h = heads
         // [b, n, 3 * heads * dim_head] -> [b, n, 3, heads, dim_head]
         let (h, qkv) = (self.heads, 3);
-        let xs = einops!("b n ({qkv} {h} d) -> {qkv} b {h} n d", &xs);
+        let b = xs.dim(0)?;
+        let n = xs.dim(1)?;
+        let total_dim = xs.dim(2)?;
+        let dim_head = total_dim / (qkv * h);
+        let xs = xs.reshape(&[b, n, qkv, h, dim_head])?;
+        let xs = xs.permute([2, 0, 3, 1, 4])?;
 
         // chunk qkv into q, k, v
-        let chunks = xs.chunk(3, 0)?;
+        let chunks = xs.chunk(qkv, 0)?;
         let q = chunks[0].contiguous()?;
         let k = chunks[1].contiguous()?;
         let v = chunks[2].contiguous()?;
@@ -317,7 +335,8 @@ impl Module for ToValueResidualMix {
         let xs = sigmoid(&xs)?;
 
         // einsum: 'b n h -> b h n 1'
-        let xs = einops!("b n h -> b h n 1", &xs);
+        let xs = xs.transpose(1, 2)?;
+        let xs = xs.unsqueeze(D::Minus1)?;
 
         Ok(xs)
     }
@@ -343,8 +362,8 @@ impl Module for ToVGates {
         let xs = sigmoid(&xs)?;
 
         // einsum: 'b n h -> b h n 1'
-        let h = self.heads;
-        let xs = einops!("b n h -> b {h} n 1", &xs);
+        let xs = xs.transpose(1, 2)?;
+        let xs = xs.unsqueeze(D::Minus1)?;
 
         Ok(xs)
     }
@@ -376,7 +395,11 @@ impl ToOut {
 impl Module for ToOut {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // einsum 'b n h d -> b n (h d)'
-        let xs = einops!("b n h d -> b n (h d)", &xs);
+        let b = xs.dim(0)?; // batch size
+        let n = xs.dim(1)?; // num tokens
+        let h = xs.dim(2)?; // num heads
+        let d = xs.dim(3)?; // dim head
+        let xs = xs.reshape(&[b, n, h * d])?;
         let xs = self.linear.forward(&xs)?;
         let xs = self.dropout.forward(&xs, self.is_train)?;
 

@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 candle-core = "0.8"
-candle-einops = { git = "https://github.com/dancixx/candle-einops.git" }
 candle-ext = { git = "https://github.com/dancixx/candle-ext.git" }
 candle-nn = "0.8.1"
 either = "1.13.0"
