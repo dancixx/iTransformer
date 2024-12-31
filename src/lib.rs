@@ -145,14 +145,14 @@ impl ITransformer {
         let mut mem_ps = 0;
 
         if has_mem {
-            let m = self.mem_tokens.as_ref().unwrap().dim(0)?;
-            let d = self.mem_tokens.as_ref().unwrap().dim(1)?;
-            let repeated =
-                self.mem_tokens
-                    .as_ref()
-                    .unwrap()
-                    .unsqueeze(0)?
-                    .repeat(&[xs.dim(0)?, m, d])?;
+            let mem_tokens = self.mem_tokens.as_ref().unwrap();
+            let b = xs.dim(0)?; // batch-méret
+            let m = mem_tokens.dim(0)?;
+            let d = mem_tokens.dim(1)?;
+
+            let repeated = mem_tokens
+              .unsqueeze(0)?
+              .repeat(&[b, 1, 1])?.to_dtype(DType::F32)?;
             mem_ps = repeated.dim(1)?;
             xs = Tensor::cat(&[repeated, xs.clone()], 1)?;
         }
@@ -261,7 +261,7 @@ impl MlpIn {
         Ok(Self {
             num_tokens_per_variate,
             linear: linear(dim, hidden_size, vb.pp("mlp_in_linear"))?,
-            layer_norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("mlp_in_layernorm"))?,
+            layer_norm: layer_norm(hidden_size, LayerNormConfig::default(), vb.pp("mlp_in_layernorm"))?,
         })
     }
 }
@@ -478,6 +478,8 @@ impl Attention {
         }
 
         let out = self.attend.forward(&q, &k, &v)?;
+        let gates = self.to_v_gates.forward(&xs)?;
+        let out = out.broadcast_mul(&gates)?;
         let out = self.to_out.forward(&out)?;
 
         Ok((out, cache_v))
@@ -619,14 +621,8 @@ impl Attend {
 
         if self.is_causal {
             let (i, j, dtype) = (sim.dim(D::Minus2)?, sim.dim(D::Minus1)?, sim.dtype());
-            // select the causal mask value based on the dtype
-            let mask_value = match dtype {
-                DType::F32 => f32::NEG_INFINITY as f64,
-                DType::F64 => f64::NEG_INFINITY,
-                _ => panic!("Unsupported dtype for causal mask"),
-            };
             let casual_mask = Tensor::triu2(j - i + 1, DType::U8, &self.device)?;
-            sim = sim.masked_fill(&casual_mask, mask_value)?;
+            sim = sim.masked_fill(&casual_mask, f32::NEG_INFINITY)?;
         }
 
         let attn = softmax_last_dim(&sim)?;
@@ -666,8 +662,8 @@ type RevInResult = Result<(
 
 impl RevIn {
     fn new(num_variants: usize, affine: Option<bool>, eps: Option<f64>) -> Self {
-        let gamma = Tensor::ones((num_variants, 1), DType::F64, &Device::Cpu).unwrap();
-        let beta = Tensor::zeros((num_variants, 1), DType::F64, &Device::Cpu).unwrap();
+        let gamma = Tensor::ones((num_variants, 1), DType::F32, &Device::Cpu).unwrap();
+        let beta = Tensor::zeros((num_variants, 1), DType::F32, &Device::Cpu).unwrap();
 
         Self {
             num_variants,
@@ -690,9 +686,9 @@ impl RevIn {
             .mean_keepdim(D::Minus1)?;
         let var_rsqrt = biased_var.clamp(self.eps, f64::INFINITY)?.sqrt()?.recip()?;
         let instance_norm = xs.broadcast_sub(&mean)?.broadcast_mul(&var_rsqrt)?;
-        let rescaled = (instance_norm
+        let rescaled = instance_norm
             .broadcast_mul(&self.gamma)?
-            .broadcast_add(&self.beta))?;
+            .broadcast_add(&self.beta)?;
 
         let reverse_fn = {
             let mean = mean.clone();
@@ -800,11 +796,11 @@ mod tests {
 
     #[test]
     fn test_itransformer() -> Result<()> {
-        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F64, &Device::Cpu);
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &Device::Cpu);
         let model = ITransformer::new(
             &vb,
-            137,
-            96,
+            16,
+            24,
             6,
             256,
             Some(1),
@@ -821,7 +817,7 @@ mod tests {
             &Device::Cpu,
         )?;
 
-        let time_series = Tensor::randn(0., 1., (2, 96, 137), &Device::Cpu)?;
+        let time_series = Tensor::randn(0., 1., (2, 24, 16), &Device::Cpu)?.to_dtype(DType::F32)?;
         let preds = model.forward(&time_series, None)?;
 
         println!("{:?}", preds);
