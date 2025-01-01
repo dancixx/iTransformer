@@ -53,7 +53,7 @@ impl ITransformer {
         let reversible_instance_norm_affine = reversible_instance_norm_affine.unwrap_or(true);
 
         let mem_tokens = if num_mem_tokens > 0 {
-            Some(Tensor::randn(0.0, 1.0, (num_mem_tokens, dim), device)?)
+            Some(Tensor::randn(0.0f32, 1.0f32, (num_mem_tokens, dim), device)?)
         } else {
             None
         };
@@ -63,7 +63,8 @@ impl ITransformer {
                 num_variates,
                 Some(reversible_instance_norm_affine),
                 None,
-            ))
+                device
+            )?)
         } else {
             None
         };
@@ -81,6 +82,7 @@ impl ITransformer {
                 Some(flash_attn),
                 None,
                 None,
+                &device
             )?;
             let ff = FeedForward::new(vb, Some(idx), dim, ff_mult, Some(ff_dropout), None)?;
             layers.push((attn, ff));
@@ -430,6 +432,7 @@ impl Attention {
         is_flash: Option<bool>,
         is_train: Option<bool>,
         learned_value_residual_mix: Option<bool>,
+        device: &Device
     ) -> Result<Self> {
         let dim_head = dim_head.unwrap_or(32);
         let heads = heads.unwrap_or(4);
@@ -455,7 +458,7 @@ impl Attention {
             to_qkv,
             to_value_residual_mix,
             to_v_gates,
-            attend: Attend::new(drop_p, None, None, is_flash, None, None)?,
+            attend: Attend::new(drop_p, None, None, is_flash, None, None, &device)?,
             to_out,
             dropout: Dropout::new(drop_p.unwrap_or(0.0)),
             learned_value_residual_mix: learned_value_residual_mix.unwrap_or(false),
@@ -573,12 +576,9 @@ impl Attend {
         is_flash: Option<bool>,
         is_causal: Option<bool>,
         is_train: Option<bool>,
+        device: &Device,
     ) -> Result<Self> {
-        let device = if cuda_is_available() {
-            Device::cuda_if_available(0)?
-        } else {
-            Device::Cpu
-        };
+
 
         Ok(Self {
             scale,
@@ -587,7 +587,7 @@ impl Attend {
             heads: heads.unwrap_or(8),
             is_flash: is_flash.unwrap_or(false),
             is_causal: is_causal.unwrap_or(false),
-            device,
+            device: device.clone(),
             is_train: is_train.unwrap_or(false),
         })
     }
@@ -629,10 +629,11 @@ impl Attend {
         let attn = attn.to_dtype(q.dtype())?;
         let attn = self.attn_dropout.forward(&attn, self.is_train)?;
 
+        // einsum('b h i j, b h j d -> b h i d', attn, v)
         let v_t = v.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-        let attn = attn.matmul(&v_t);
+        let attn = attn.matmul(&v_t)?;
 
-        attn
+        Ok(attn)
     }
 }
 
@@ -661,17 +662,17 @@ type RevInResult = Result<(
 )>;
 
 impl RevIn {
-    fn new(num_variants: usize, affine: Option<bool>, eps: Option<f64>) -> Self {
-        let gamma = Tensor::ones((num_variants, 1), DType::F32, &Device::Cpu).unwrap();
-        let beta = Tensor::zeros((num_variants, 1), DType::F32, &Device::Cpu).unwrap();
+    fn new(num_variants: usize, affine: Option<bool>, eps: Option<f64>, device: &Device) -> Result<Self> {
+        let gamma = Tensor::ones((num_variants, 1), DType::F32, device)?;
+        let beta = Tensor::zeros((num_variants, 1), DType::F32, device)?;
 
-        Self {
+        Ok(Self {
             num_variants,
             affine: affine.unwrap_or(true),
             eps: eps.unwrap_or(1e-5),
             gamma,
             beta,
-        }
+        })
     }
 
     fn forward(self, xs: &Tensor, return_statistics: Option<bool>) -> RevInResult {
@@ -722,13 +723,17 @@ impl RevIn {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::LazyCell;
+    use std::sync::{LazyLock, OnceLock};
     use crate::{ITransformer, RevIn};
     use candle_core::{DType, Device, Result, Tensor};
     use candle_nn::{VarBuilder, VarMap};
 
+    static DEVICE: LazyLock<Device> = LazyLock::new(|| Device::new_metal(0).unwrap());
+
     #[test]
     fn test_rev_in_v1() {
-        let rev_in = RevIn::new(4, None, None);
+        let rev_in = RevIn::new(4, None, None, &DEVICE).unwrap();
         let data = vec![
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
             17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0, 30.0,
@@ -737,7 +742,7 @@ mod tests {
             59.0, 60.0, 61.0, 62.0, 63.0, 64.0,
         ];
 
-        let xs = Tensor::from_vec(data, (2, 4, 8), &Device::Cpu).unwrap();
+        let xs = Tensor::from_vec(data, (2, 4, 8), &DEVICE).unwrap();
         let (normalized, reverse_fn, _) = rev_in.forward(&xs, Some(true)).unwrap();
         let out = reverse_fn(&normalized).unwrap();
 
@@ -766,8 +771,8 @@ mod tests {
 
     #[test]
     fn test_rev_in_v2() {
-        let rev_in = RevIn::new(4, None, None);
-        let xs = Tensor::randn(0., 1., (2, 4, 8), &Device::Cpu).unwrap();
+        let rev_in = RevIn::new(4, None, None, &DEVICE).unwrap();
+        let xs = Tensor::randn(0., 1., (2, 4, 8), &DEVICE).unwrap();
         let (normalized, reverse_fn, _) = rev_in.forward(&xs, Some(true)).unwrap();
         let out = reverse_fn(&normalized).unwrap();
 
@@ -796,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_itransformer() -> Result<()> {
-        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &Device::Cpu);
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &DEVICE);
         let model = ITransformer::new(
             &vb,
             16,
@@ -814,10 +819,10 @@ mod tests {
             Some(true),
             None,
             false,
-            &Device::Cpu,
+            &DEVICE
         )?;
 
-        let time_series = Tensor::randn(0., 1., (2, 24, 16), &Device::Cpu)?.to_dtype(DType::F32)?;
+        let time_series = Tensor::randn(0.0f32, 1.0f32, (2, 24, 16), &DEVICE)?.to_dtype(DType::F32)?;
         let preds = model.forward(&time_series, None)?;
 
         println!("{:?}", preds);
