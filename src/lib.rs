@@ -1,7 +1,8 @@
 use either::Either;
 use tch::{
     nn::{layer_norm, linear, seq, LayerNorm, LayerNormConfig, Linear, Module, ModuleT, Path},
-    Device, Result, Tensor,
+    utils::has_cuda,
+    Cuda, Device, Kind, Result, Tensor,
 };
 
 // pub struct ITransformer {
@@ -548,86 +549,91 @@ impl ModuleT for FeedForward {
         xs
     }
 }
-//
-// struct Attend {
-//     scale: Option<f64>,
-//     drop_p: f32,
-//     is_train: bool,
-//     attn_dropout: Dropout,
-//     heads: usize,
-//     is_flash: bool,
-//     is_causal: bool,
-//     device: Device,
-// }
-//
-// impl Attend {
-//     fn new(
-//         drop_p: Option<f32>,
-//         heads: Option<usize>,
-//         scale: Option<f64>,
-//         is_flash: Option<bool>,
-//         is_causal: Option<bool>,
-//         is_train: Option<bool>,
-//         device: &Device,
-//     ) -> Result<Self> {
-//
-//
-//         Ok(Self {
-//             scale,
-//             drop_p: drop_p.unwrap_or(0.0),
-//             attn_dropout: Dropout::new(drop_p.unwrap_or(0.)),
-//             heads: heads.unwrap_or(8),
-//             is_flash: is_flash.unwrap_or(false),
-//             is_causal: is_causal.unwrap_or(false),
-//             device: device.clone(),
-//             is_train: is_train.unwrap_or(false),
-//         })
-//     }
-//
-//     fn flash_attn(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-//         F::scaled_dot_product_attention(
-//             q,
-//             k,
-//             v,
-//             None,
-//             Some(self.drop_p),
-//             Some(self.is_causal),
-//             self.scale,
-//         )
-//     }
-//
-//     fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-//         let scale = if let Some(scale) = self.scale {
-//             scale
-//         } else {
-//             (q.dim(D::Minus1)? as f64).sqrt()
-//         };
-//
-//         if self.is_flash {
-//             return self.flash_attn(q, k, v);
-//         }
-//
-//         // einsum('b h i d, b h j d -> b h i j', q, k)
-//         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-//         let mut sim = (q.matmul(&k_t)? * scale)?;
-//
-//         if self.is_causal {
-//             let (i, j, dtype) = (sim.dim(D::Minus2)?, sim.dim(D::Minus1)?, sim.dtype());
-//             let casual_mask = Tensor::triu2(j - i + 1, DType::U8, &self.device)?;
-//             sim = sim.masked_fill(&casual_mask, f32::NEG_INFINITY)?;
-//         }
-//
-//         let attn = softmax_last_dim(&sim)?;
-//         let attn = attn.to_dtype(q.dtype())?;
-//         let attn = self.attn_dropout.forward(&attn, self.is_train)?;
-//
-//         // einsum('b h i j, b h j d -> b h i d', attn, v)
-//         let v_t = v.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-//         let attn = attn.matmul(&v_t)?;
-//
-//         Ok(attn)
-//     }
-// }
+
+#[derive(Debug)]
+struct Attend {
+    scale: Option<f64>,
+    drop_p: f64,
+    heads: i64,
+    is_flash: bool,
+    is_causal: bool,
+}
+
+impl Attend {
+    fn new(
+        drop_p: Option<f64>,
+        heads: Option<i64>,
+        scale: Option<f64>,
+        is_flash: Option<bool>,
+        is_causal: Option<bool>,
+    ) -> Self {
+        Self {
+            scale,
+            drop_p: drop_p.unwrap_or(0.0),
+            heads: heads.unwrap_or(8),
+            is_flash: is_flash.unwrap_or(false),
+            is_causal: is_causal.unwrap_or(false),
+        }
+    }
+
+    fn flash_attn(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        // SDPA Backend is not implemented yet
+        Ok(Tensor::scaled_dot_product_attention::<Tensor>(
+            q,
+            k,
+            v,
+            None,
+            self.drop_p,
+            self.is_causal,
+            self.scale,
+            false,
+        ))
+    }
+
+    fn forward_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, train: bool) -> Result<Tensor> {
+        let q_size = q.size();
+        let scale = self
+            .scale
+            .unwrap_or((q_size[q_size.len() - 1] as f64).sqrt());
+
+        if self.is_flash {
+            return self.flash_attn(q, k, v);
+        }
+
+        // einsum('b h i d, b h j d -> b h i j', q, k)
+        // b: batch size
+        // h: num heads
+        // n, i, j: sequence length (base sequence length, source sequence length, target sequence length)
+        // d: feature dimension
+        let k_t = k.transpose(-2, -1);
+        let mut sim = q.matmul(&k_t) * scale;
+
+        if self.is_causal {
+            let sim_dims = sim.size();
+            let (i, j, dtype) = (
+                sim_dims[sim_dims.len() - 2],
+                sim_dims[sim_dims.len() - 1],
+                sim.kind(),
+            );
+            let mask_value = match dtype {
+                Kind::Float => f64::NEG_INFINITY,
+                Kind::Double => f64::NEG_INFINITY,
+                _ => unreachable!(),
+            };
+            let casual_mask = Tensor::ones(&[i, j], (Kind::Bool, q.device())).triu(j - i + 1);
+            sim = sim.masked_fill(&casual_mask, mask_value);
+        }
+
+        let attn = sim.softmax(-1, sim.kind());
+        let attn = attn.to_kind(sim.kind());
+        let attn = attn.dropout(self.drop_p, train);
+
+        // einsum('b h i j, b h j d -> b h i d', attn, v)
+        let attn = attn.matmul(&v);
+
+        Ok(attn)
+    }
+}
 
 struct Statistics {
     mean: Tensor,
@@ -788,6 +794,88 @@ mod tests {
         let xs = Tensor::randn(&[2, 512], (Kind::Float, *DEVICE));
         let feed_forward = FeedForward::new(&(vs.root() / "ff"), 512, 4, Some(0.1));
         let _ = feed_forward.forward_t(&xs, true);
+    }
+
+    #[test]
+    fn test_attend_einsum_operations() {
+        let b = 2; // batch size
+        let h = 4; // number of heads
+        let i = 5; // query length
+        let j = 5; // key length
+        let d = 8; // dimension
+        let scale = 0.125;
+
+        // Initialize tensors
+        let q = Tensor::randn(&[b, h, i, d], (Kind::Float, Device::Cpu));
+        let k = Tensor::randn(&[b, h, j, d], (Kind::Float, Device::Cpu));
+        let v = Tensor::randn(&[b, h, j, d], (Kind::Float, Device::Cpu));
+
+        // Verify tensor shapes
+        assert_eq!(q.size(), vec![b, h, i, d]);
+        assert_eq!(k.size(), vec![b, h, j, d]);
+        assert_eq!(v.size(), vec![b, h, j, d]);
+
+        // 1. Attention Logit Matrix: einsum('b h i d, b h j d -> b h i j', q, k) * scale
+        let k_t = k.transpose(-2, -1); // Transpose: [b, h, j, d] -> [b, h, d, j]
+        let sim = q.matmul(&k_t) * scale; // [b, h, i, d] x [b, h, d, j] -> [b, h, i, j]
+
+        // Verify result shape
+        assert_eq!(sim.size(), vec![b, h, i, j]);
+
+        // Apply softmax to the similarity matrix
+        let attn = sim.softmax(-1, Kind::Float); // Softmax on the last dimension (j)
+
+        // 2. Apply attention to the Value tensor: einsum('b h i j, b h j d -> b h i d', attn, v)
+        let attn_output = attn.matmul(&v); // [b, h, i, j] x [b, h, j, d] -> [b, h, i, d]
+
+        // Verify final result shape
+        assert_eq!(attn_output.size(), vec![b, h, i, d]);
+
+        println!("Attention logit shape: {:?}", sim.size());
+        println!("Attention output shape: {:?}", attn_output.size());
+    }
+
+    #[test]
+    fn test_attend_forward() {
+        let b = 2; // batch size
+        let h = 4; // number of heads
+        let i = 5; // query length
+        let j = 5; // key length
+        let d = 8; // dimension
+
+        // Initialize tensors
+        let q = Tensor::randn(&[b, h, i, d], (Kind::Float, Device::Cpu));
+        let k = Tensor::randn(&[b, h, j, d], (Kind::Float, Device::Cpu));
+        let v = Tensor::randn(&[b, h, j, d], (Kind::Float, Device::Cpu));
+
+        // Iterate over all boolean combinations
+        let combinations = [(false, false), (false, true), (true, false), (true, true)];
+
+        for (is_flash, is_causal) in combinations {
+            let attend = Attend::new(
+                Some(0.1),
+                Some(4),
+                Some(0.125),
+                Some(is_flash),
+                Some(is_causal),
+            );
+            println!(
+                "Testing Attend with is_flash: {}, is_causal: {}",
+                is_flash, is_causal
+            );
+
+            match attend.forward_t(&q, &k, &v, true) {
+                Ok(result) => {
+                    println!("Success! Output shape: {:?}\n", result.size());
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Error with is_flash: {}, is_causal: {}: {}\n",
+                        is_flash, is_causal, err
+                    );
+                }
+            }
+        }
     }
 
     // #[test]
