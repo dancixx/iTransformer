@@ -1,5 +1,8 @@
 use either::Either;
-use tch::{Device, Result, Tensor};
+use tch::{
+    nn::{Module, ModuleT},
+    Device, Result, Tensor,
+};
 
 // pub struct ITransformer {
 //     num_variates: usize,
@@ -484,15 +487,31 @@ use tch::{Device, Result, Tensor};
 //     }
 // }
 //
-// struct GEGLU;
-//
-// impl Module for GEGLU {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let (x, gate) = xs.chunk2(D::Minus1)?;
-//         let gate = gate.gelu()?;
-//         x * gate
-//     }
-// }
+
+#[derive(Debug)]
+struct GEGLU;
+
+impl Module for GEGLU {
+    fn forward(&self, xs: &Tensor) -> Tensor {
+        let tensors = self.rearrange(xs);
+        let gate = tensors[1].gelu("none");
+        // TODO: find a way to avoid cloning the variables
+        let x = tensors[0].copy();
+        x * gate
+    }
+}
+
+impl GEGLU {
+    fn rearrange(&self, xs: &Tensor) -> Vec<Tensor> {
+        let last_dim = xs.size();
+        let last_dim = last_dim[last_dim.len() - 1];
+        // x, gate = rearrange(x, '... (r d) -> r ... d', r = 2)
+        let reshaped = xs.view([-1, 2, last_dim / 2]);
+        let tensors = reshaped.unbind(1);
+        tensors
+    }
+}
+
 //
 // struct FeedForward {
 //     is_train: bool,
@@ -751,6 +770,29 @@ mod tests {
         let out = reverse_fn(&normalized).unwrap();
 
         assert_eq!(Tensor::allclose(&xs, &out, 1e-5, 1e-5, false), true);
+    }
+
+    #[test]
+    fn test_geglu_rearrange() {
+        let data = (1..=8).collect::<Vec<_>>();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 4])
+            .to_device(*DEVICE);
+
+        let last_dim = xs.size();
+        let last_dim = last_dim[last_dim.len() - 1];
+        let reshaped = xs.view([-1, 2, last_dim / 2]);
+        let tensors = reshaped.unbind(1);
+
+        let x = Tensor::from_slice(&[1, 2, 5, 6])
+            .reshape(&[2, 2])
+            .to_device(*DEVICE);
+        assert_eq!(tensors[0], x);
+
+        let gate = Tensor::from_slice(&[3, 4, 7, 8])
+            .reshape(&[2, 2])
+            .to_device(*DEVICE);
+        assert_eq!(tensors[1], gate);
     }
 
     // #[test]
