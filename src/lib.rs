@@ -1,6 +1,6 @@
 use either::Either;
 use tch::{
-    nn::{Module, ModuleT},
+    nn::{layer_norm, linear, seq, LayerNorm, LayerNormConfig, Linear, Module, ModuleT, Path},
     Device, Result, Tensor,
 };
 
@@ -512,64 +512,42 @@ impl GEGLU {
     }
 }
 
-//
-// struct FeedForward {
-//     is_train: bool,
-//     layer_norm: LayerNorm,
-//     linear1: Linear,
-//     geglu: GEGLU,
-//     dropout: Dropout,
-//     linear2: Linear,
-// }
-//
-// impl FeedForward {
-//     fn new(
-//         vb: &VarBuilder,
-//         idx: Option<usize>,
-//         dim: usize,
-//         mult: usize,
-//         drop_p: Option<f32>,
-//         is_train: Option<bool>,
-//     ) -> Result<Self> {
-//         let hidden_size = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as usize;
-//
-//         let layer_norm = layer_norm(
-//             dim,
-//             LayerNormConfig::default(),
-//             vb.pp(format!("ff_{}_layer_norm", idx.unwrap_or(0))),
-//         )?;
-//         let linear1 = linear(
-//             dim,
-//             hidden_size,
-//             vb.pp(format!("ff_{}_linear1", idx.unwrap_or(0))),
-//         )?;
-//         let linear2 = linear(
-//             hidden_size,
-//             dim,
-//             vb.pp(format!("ff_{}_linear2", idx.unwrap_or(0))),
-//         )?;
-//
-//         Ok(Self {
-//             is_train: is_train.unwrap_or(false),
-//             layer_norm,
-//             linear1,
-//             geglu: GEGLU,
-//             dropout: Dropout::new(drop_p.unwrap_or(0.0)),
-//             linear2,
-//         })
-//     }
-// }
-//
-// impl Module for FeedForward {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let xs = self.layer_norm.forward(xs)?;
-//         let xs = self.linear1.forward(&xs)?;
-//         let xs = self.geglu.forward(&xs)?;
-//         let xs = self.dropout.forward(&xs, self.is_train)?;
-//         let xs = self.linear2.forward(&xs)?;
-//         Ok(xs)
-//     }
-// }
+#[derive(Debug)]
+struct FeedForward {
+    drop_p: f64,
+    norm: LayerNorm,
+    linear1: Linear,
+    geglu: GEGLU,
+    linear2: Linear,
+}
+
+impl FeedForward {
+    fn new(vs: &Path, dim: i64, mult: i64, drop_p: Option<f64>) -> Self {
+        let hidden_size = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as i64;
+        let norm = layer_norm(vs, vec![dim], LayerNormConfig::default());
+        let linear1 = linear(vs, dim, hidden_size * 2, Default::default());
+        let linear2 = linear(vs, hidden_size, dim, Default::default());
+
+        Self {
+            drop_p: drop_p.unwrap_or(0.0),
+            norm,
+            linear1,
+            geglu: GEGLU,
+            linear2,
+        }
+    }
+}
+
+impl ModuleT for FeedForward {
+    fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor {
+        let xs = self.norm.forward(xs);
+        let xs = self.linear1.forward(&xs);
+        let xs = self.geglu.forward(&xs);
+        let xs = xs.dropout(self.drop_p, train);
+        let xs = self.linear2.forward(&xs);
+        xs
+    }
+}
 //
 // struct Attend {
 //     scale: Option<f64>,
@@ -738,7 +716,7 @@ impl RevIn {
 mod tests {
     use super::*;
     use std::sync::LazyLock;
-    use tch::{Device, Kind, Tensor};
+    use tch::{nn::VarStore, Device, Kind, Tensor};
 
     static DEVICE: LazyLock<Device> = LazyLock::new(|| Device::Cpu);
 
@@ -779,10 +757,8 @@ mod tests {
             .reshape(&[2, 4])
             .to_device(*DEVICE);
 
-        let last_dim = xs.size();
-        let last_dim = last_dim[last_dim.len() - 1];
-        let reshaped = xs.view([-1, 2, last_dim / 2]);
-        let tensors = reshaped.unbind(1);
+        let geglu = GEGLU;
+        let tensors = geglu.rearrange(&xs);
 
         let x = Tensor::from_slice(&[1, 2, 5, 6])
             .reshape(&[2, 2])
@@ -793,6 +769,25 @@ mod tests {
             .reshape(&[2, 2])
             .to_device(*DEVICE);
         assert_eq!(tensors[1], gate);
+    }
+
+    #[test]
+    fn test_geglu_forward() {
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 4])
+            .to_device(*DEVICE);
+
+        let geglu = GEGLU;
+        let _ = geglu.forward(&xs);
+    }
+
+    #[test]
+    fn test_feed_forward() {
+        let vs = VarStore::new(*DEVICE);
+        let xs = Tensor::randn(&[2, 512], (Kind::Float, *DEVICE));
+        let feed_forward = FeedForward::new(&(vs.root() / "ff"), 512, 4, Some(0.1));
+        let _ = feed_forward.forward_t(&xs, true);
     }
 
     // #[test]
