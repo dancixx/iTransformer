@@ -1,8 +1,9 @@
 use either::Either;
 use tch::{
-    nn::{layer_norm, linear, seq, LayerNorm, LayerNormConfig, Linear, Module, ModuleT, Path},
-    utils::has_cuda,
-    Cuda, Device, Kind, Result, Tensor,
+    nn::{
+        layer_norm, linear, LayerNorm, LayerNormConfig, Linear, LinearConfig, Module, ModuleT, Path,
+    },
+    Device, Kind, Result, Tensor,
 };
 
 // pub struct ITransformer {
@@ -282,212 +283,249 @@ use tch::{
 //     }
 // }
 //
-// struct ToQKV {
-//     linear: Linear,
-//     heads: usize,
-// }
-//
-// impl ToQKV {
-//     fn new(vb: &VarBuilder, dim: usize, hidden_size: usize, heads: usize) -> Result<Self> {
-//         Ok(Self {
-//             linear: linear(dim, hidden_size * 3, vb.pp("attn_to_qkv"))?,
-//             heads,
-//         })
-//     }
-//
-//     fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-//         let xs = self.linear.forward(xs)?;
-//         // einsum: rearrange 'b n (qkv h d) -> qkv b h n d', where qkv = 3 & h = heads
-//         // [b, n, 3 * heads * dim_head] -> [b, n, 3, heads, dim_head]
-//         let (h, qkv) = (self.heads, 3);
-//         let b = xs.dim(0)?;
-//         let n = xs.dim(1)?;
-//         let total_dim = xs.dim(2)?;
-//         let dim_head = total_dim / (qkv * h);
-//         let xs = xs.reshape(&[b, n, qkv, h, dim_head])?;
-//         let xs = xs.permute([2, 0, 3, 1, 4])?;
-//
-//         // chunk qkv into q, k, v
-//         let chunks = xs.chunk(qkv, 0)?;
-//         let q = chunks[0].contiguous()?;
-//         let k = chunks[1].contiguous()?;
-//         let v = chunks[2].contiguous()?;
-//
-//         Ok((q, k, v))
-//     }
-// }
-//
-// #[derive(Clone)]
-// pub struct ToValueResidualMix {
-//     linear: Linear,
-// }
-//
-// impl ToValueResidualMix {
-//     fn new(vb: &VarBuilder, dim: usize, heads: usize) -> Result<Self> {
-//         Ok(Self {
-//             linear: linear(dim, heads, vb.pp("attn_to_value_residual_mix"))?,
-//         })
-//     }
-// }
-//
-// impl Module for ToValueResidualMix {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let xs = self.linear.forward(&xs)?;
-//         let xs = sigmoid(&xs)?;
-//
-//         // einsum: 'b n h -> b h n 1'
-//         let xs = xs.transpose(1, 2)?;
-//         let xs = xs.unsqueeze(D::Minus1)?;
-//
-//         Ok(xs)
-//     }
-// }
-//
-// struct ToVGates {
-//     linear: Linear,
-//     heads: usize,
-// }
-//
-// impl ToVGates {
-//     fn new(vb: &VarBuilder, dim: usize, heads: usize) -> Result<Self> {
-//         Ok(Self {
-//             linear: linear(dim, heads, vb.pp("attn_to_v_gates"))?,
-//             heads,
-//         })
-//     }
-// }
-//
-// impl Module for ToVGates {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let xs = self.linear.forward(&xs)?;
-//         let xs = sigmoid(&xs)?;
-//
-//         // einsum: 'b n h -> b h n 1'
-//         let xs = xs.transpose(1, 2)?;
-//         let xs = xs.unsqueeze(D::Minus1)?;
-//
-//         Ok(xs)
-//     }
-// }
-//
-// pub struct ToOut {
-//     linear: Linear,
-//     dropout: Dropout,
-//     is_train: bool,
-// }
-//
-// impl ToOut {
-//     fn new(
-//         vb: &VarBuilder,
-//         dim: usize,
-//         heads: usize,
-//         dim_head: usize,
-//         drop_p: f32,
-//         is_train: Option<bool>,
-//     ) -> Result<Self> {
-//         Ok(Self {
-//             linear: linear(dim_head * heads, dim, vb.pp("attn_to_out"))?,
-//             dropout: Dropout::new(drop_p),
-//             is_train: is_train.unwrap_or(false),
-//         })
-//     }
-// }
-//
-// impl Module for ToOut {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         // einsum 'b n h d -> b n (h d)'
-//         let b = xs.dim(0)?; // batch size
-//         let n = xs.dim(1)?; // num tokens
-//         let h = xs.dim(2)?; // num heads
-//         let d = xs.dim(3)?; // dim head
-//         let xs = xs.reshape(&[b, n, h * d])?;
-//         let xs = self.linear.forward(&xs)?;
-//         let xs = self.dropout.forward(&xs, self.is_train)?;
-//
-//         Ok(xs)
-//     }
-// }
-//
-// struct Attention {
-//     scale: f64,
-//     layer_norm: LayerNorm,
-//     to_qkv: ToQKV,
-//     to_value_residual_mix: Option<ToValueResidualMix>,
-//     to_v_gates: ToVGates,
-//     attend: Attend,
-//     to_out: ToOut,
-//     dropout: Dropout,
-//     learned_value_residual_mix: bool,
-// }
-//
-// impl Attention {
-//     fn new(
-//         vb: &VarBuilder,
-//         idx: Option<usize>,
-//         dim: usize,
-//         dim_head: Option<usize>,
-//         heads: Option<usize>,
-//         drop_p: Option<f32>,
-//         is_flash: Option<bool>,
-//         is_train: Option<bool>,
-//         learned_value_residual_mix: Option<bool>,
-//         device: &Device
-//     ) -> Result<Self> {
-//         let dim_head = dim_head.unwrap_or(32);
-//         let heads = heads.unwrap_or(4);
-//         let scale = (dim_head as f64).sqrt();
-//
-//         let layer_norm = layer_norm(
-//             dim,
-//             LayerNormConfig::default(),
-//             vb.pp(format!("attn_{}_layernorm", idx.unwrap_or(0))),
-//         )?;
-//         let to_qkv = ToQKV::new(vb, dim, dim_head, heads)?;
-//         let to_value_residual_mix = if learned_value_residual_mix.unwrap_or(false) {
-//             Some(ToValueResidualMix::new(vb, dim, heads)?)
-//         } else {
-//             None
-//         };
-//         let to_v_gates = ToVGates::new(vb, dim, heads)?;
-//         let to_out = ToOut::new(vb, dim, heads, dim_head, drop_p.unwrap_or(0.0), is_train)?;
-//
-//         Ok(Self {
-//             scale,
-//             layer_norm,
-//             to_qkv,
-//             to_value_residual_mix,
-//             to_v_gates,
-//             attend: Attend::new(drop_p, None, None, is_flash, None, None, &device)?,
-//             to_out,
-//             dropout: Dropout::new(drop_p.unwrap_or(0.0)),
-//             learned_value_residual_mix: learned_value_residual_mix.unwrap_or(false),
-//         })
-//     }
-//
-//     fn forward(&self, xs: &Tensor, value_residual: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
-//         let xs = self.layer_norm.forward(xs)?;
-//         let (q, k, mut v) = self.to_qkv.forward(&xs)?;
-//         let cache_v = v.clone();
-//         let lerp = |start: &Tensor, end: &Tensor, weight: &Tensor| -> Result<Tensor> {
-//             (start * (1.0 - weight))? + (end * weight)?
-//         };
-//
-//         if let Some(to_value_residual_mix) = &self.to_value_residual_mix {
-//             if let Some(value_residual) = value_residual {
-//                 let mix = self.to_value_residual_mix.as_ref().unwrap().forward(&xs)?;
-//                 v = lerp(&v, value_residual, &mix)?;
-//             }
-//         }
-//
-//         let out = self.attend.forward(&q, &k, &v)?;
-//         let gates = self.to_v_gates.forward(&xs)?;
-//         let out = out.broadcast_mul(&gates)?;
-//         let out = self.to_out.forward(&out)?;
-//
-//         Ok((out, cache_v))
-//     }
-// }
-//
+
+#[derive(Debug)]
+struct ToQKV {
+    linear: Linear,
+    heads: i64,
+}
+
+impl ToQKV {
+    fn new(vs: &Path, dim: i64, hidden_size: i64, heads: i64) -> Self {
+        Self {
+            linear: linear(
+                vs,
+                dim,
+                hidden_size * 3,
+                LinearConfig {
+                    bias: false,
+                    ..Default::default()
+                },
+            ),
+            heads,
+        }
+    }
+
+    fn rearrange(&self, xs: &Tensor) -> (Tensor, Tensor, Tensor) {
+        // einsum: rearrange 'b n (qkv h d) -> qkv b h n d', where qkv = 3 & h = heads
+        // [b, n, 3 * heads * dim_head] -> [b, n, 3, heads, dim_head]
+        let xs_dims = xs.size();
+        let (h, qkv) = (self.heads, 3);
+        let b = xs_dims[0];
+        let n = xs_dims[1];
+        let total_dim = xs_dims[2];
+        let dim_head = total_dim / (qkv * h);
+        let xs = xs.reshape(&[b, n, qkv, h, dim_head]);
+        let xs = xs.permute(&[2, 0, 3, 1, 4]);
+
+        let chunks = xs.chunk(qkv, 0);
+        let q = chunks[0].contiguous();
+        let k = chunks[1].contiguous();
+        let v = chunks[2].contiguous();
+
+        (q, k, v)
+    }
+
+    fn forward(&self, xs: &Tensor) -> (Tensor, Tensor, Tensor) {
+        let xs = self.linear.forward(xs);
+        let qkv = self.rearrange(&xs);
+        qkv
+    }
+}
+
+#[derive(Debug)]
+pub struct ToValueResidualMix {
+    linear: Linear,
+}
+
+impl ToValueResidualMix {
+    fn new(vs: &Path, dim: i64, heads: i64) -> Self {
+        Self {
+            linear: linear(
+                vs,
+                dim,
+                heads,
+                LinearConfig {
+                    bias: false,
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn rearrange(&self, xs: &Tensor) -> Tensor {
+        // einsum: 'b n h -> b h n 1'
+        let xs = xs.permute(&[0, 2, 1]);
+        let xs = xs.unsqueeze(-1);
+        xs
+    }
+}
+
+impl Module for ToValueResidualMix {
+    fn forward(&self, xs: &Tensor) -> Tensor {
+        let xs = self.linear.forward(&xs);
+        let xs = self.rearrange(&xs);
+        let xs = xs.sigmoid();
+        xs
+    }
+}
+
+#[derive(Debug)]
+struct ToVGates {
+    linear: Linear,
+    heads: i64,
+}
+
+impl ToVGates {
+    fn new(vs: &Path, dim: i64, heads: i64) -> Self {
+        Self {
+            linear: linear(
+                vs,
+                dim,
+                heads,
+                LinearConfig {
+                    bias: false,
+                    ..Default::default()
+                },
+            ),
+            heads,
+        }
+    }
+
+    fn rearrange(&self, xs: &Tensor) -> Tensor {
+        // einsum: 'b n h -> b h n 1', where h = heads
+        let xs = xs.permute(&[0, 2, 1]);
+        let xs = xs.unsqueeze(-1);
+        xs
+    }
+}
+
+impl Module for ToVGates {
+    fn forward(&self, xs: &Tensor) -> Tensor {
+        let xs = self.linear.forward(&xs);
+        let xs = xs.sigmoid();
+
+        // einsum: 'b n h -> b h n 1'
+        let xs = self.rearrange(&xs);
+
+        xs
+    }
+}
+
+#[derive(Debug)]
+pub struct ToOut {
+    drop_p: f64,
+    linear: Linear,
+}
+
+impl ToOut {
+    fn new(vs: &Path, dim: i64, heads: i64, dim_head: i64, drop_p: Option<f64>) -> Self {
+        Self {
+            drop_p: drop_p.unwrap_or(0.0),
+            linear: linear(
+                vs,
+                dim_head * heads,
+                dim,
+                LinearConfig {
+                    bias: false,
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn rearrange(&self, xs: &Tensor) -> Tensor {
+        // einsum 'b n h d -> b n (h d)'
+        let xs_dims = xs.size();
+        let (b, n, h, d) = (xs_dims[0], xs_dims[1], xs_dims[2], xs_dims[3]);
+        let xs = xs.reshape(&[b, n, h * d]);
+        xs
+    }
+}
+
+impl ModuleT for ToOut {
+    fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor {
+        let xs = self.rearrange(xs);
+        let xs = self.linear.forward(&xs);
+        let xs = xs.dropout(self.drop_p, train);
+        xs
+    }
+}
+
+struct Attention {
+    scale: f64,
+    drop_p: f64,
+    norm: LayerNorm,
+    to_qkv: ToQKV,
+    to_value_residual_mix: Option<ToValueResidualMix>,
+    to_v_gates: ToVGates,
+    attend: Attend,
+    to_out: ToOut,
+    learned_value_residual_mix: bool,
+}
+
+impl Attention {
+    fn new(
+        vs: &Path,
+        dim: i64,
+        dim_head: Option<i64>,
+        heads: Option<i64>,
+        drop_p: Option<f64>,
+        is_flash: Option<bool>,
+        learned_value_residual_mix: Option<bool>,
+    ) -> Self {
+        let dim_head = dim_head.unwrap_or(32);
+        let heads = heads.unwrap_or(4);
+        let scale = (dim_head as f64).sqrt();
+
+        let norm = layer_norm(vs, vec![dim], LayerNormConfig::default());
+        let to_qkv = ToQKV::new(vs, dim, dim_head, heads);
+        let to_value_residual_mix = if learned_value_residual_mix.unwrap_or(false) {
+            Some(ToValueResidualMix::new(vs, dim, heads))
+        } else {
+            None
+        };
+        let to_v_gates = ToVGates::new(vs, dim, heads);
+        let to_out = ToOut::new(vs, dim, heads, dim_head, drop_p);
+
+        Self {
+            scale,
+            drop_p: drop_p.unwrap_or(0.0),
+            norm,
+            to_qkv,
+            to_value_residual_mix,
+            to_v_gates,
+            attend: Attend::new(drop_p, None, None, is_flash, None),
+            to_out,
+            learned_value_residual_mix: learned_value_residual_mix.unwrap_or(false),
+        }
+    }
+
+    fn forward_t(
+        &self,
+        xs: &Tensor,
+        value_residual: Option<&Tensor>,
+        train: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let xs = self.norm.forward(xs);
+        let (q, k, mut v) = self.to_qkv.forward(&xs);
+        let cache_v = v.copy();
+
+        if let Some(to_value_residual_mix) = &self.to_value_residual_mix {
+            if let Some(value_residual) = value_residual {
+                let mix = self.to_value_residual_mix.as_ref().unwrap().forward(&xs);
+                v = v.lerp(&value_residual, &mix);
+            }
+        }
+
+        let out = self.attend.forward_t(&q, &k, &v, train);
+        let gates = self.to_v_gates.forward(&xs);
+        let out = out? * gates;
+        let out = self.to_out.forward_t(&out, train);
+
+        Ok((out, cache_v))
+    }
+}
 
 #[derive(Debug)]
 struct GEGLU;
@@ -876,6 +914,164 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_rearrange() {
+        // Test Parameters
+        let b = 2; // Batch size
+        let n = 3; // Sequence length
+        let qkv = 3; // Number of Q, K, V
+        let h = 2; // Number of heads
+        let dim_head = 4; // Dimension per head
+
+        let total_dim = qkv * h * dim_head; // Calculate total dimension
+
+        // Create input tensor with known values
+        let data: Vec<i64> = (1..=(b * n * total_dim)).collect();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[b, n, total_dim])
+            .to_device(Device::Cpu);
+
+        println!("Input Tensor Shape: {:?}", xs.size());
+
+        let vs = VarStore::new(*DEVICE);
+        let to_qkv = ToQKV::new(&(vs.root() / "to_qkv"), total_dim, dim_head, h);
+        let (q, k, v) = to_qkv.rearrange(&xs);
+
+        // Expected shapes
+        let expected_q_shape = [1, b, h, n, dim_head];
+        let expected_k_shape = [1, b, h, n, dim_head];
+        let expected_v_shape = [1, b, h, n, dim_head];
+
+        assert_eq!(q.size(), expected_q_shape, "Q tensor shape mismatch");
+        assert_eq!(k.size(), expected_k_shape, "K tensor shape mismatch");
+        assert_eq!(v.size(), expected_v_shape, "V tensor shape mismatch");
+
+        // Verify Q, K, V contain expected slices
+        let q_expected = xs
+            .reshape(&[b, n, qkv, h, dim_head])
+            .permute(&[2, 0, 3, 1, 4])
+            .slice(0, 0, 1, 1)
+            .contiguous();
+
+        let k_expected = xs
+            .reshape(&[b, n, qkv, h, dim_head])
+            .permute(&[2, 0, 3, 1, 4])
+            .slice(0, 1, 2, 1)
+            .contiguous();
+
+        let v_expected = xs
+            .reshape(&[b, n, qkv, h, dim_head])
+            .permute(&[2, 0, 3, 1, 4])
+            .slice(0, 2, 3, 1)
+            .contiguous();
+
+        assert_eq!(q, q_expected, "Q tensor values mismatch");
+        assert_eq!(k, k_expected, "K tensor values mismatch");
+        assert_eq!(v, v_expected, "V tensor values mismatch");
+
+        println!("Test passed: Q, K, and V tensors match the expected shapes and values!");
+    }
+
+    #[test]
+    fn test_to_qkv_forward() {
+        let b = 2; // batch size
+        let n = 3; // sequence length
+        let qkv = 3; // number of Q, K, V
+        let h = 2; // number of heads
+        let dim_head = 4; // dimension per head
+        let total_dim = qkv * h * dim_head; // calculate total dimension
+
+        // create input tensor with known values
+        let xs = Tensor::randn(&[b, n, total_dim], (Kind::Float, Device::Cpu));
+
+        let vs = VarStore::new(*DEVICE);
+        let to_qkv = ToQKV::new(&(vs.root() / "to_qkv"), total_dim, dim_head, h);
+        let _ = to_qkv.forward(&xs);
+    }
+
+    #[test]
+    fn test_to_value_residual_mix_rearrange() {
+        let module = ToValueResidualMix::new(&VarStore::new(Device::Cpu).root(), 4, 4);
+
+        // Input tensor: [batch_size, sequence_length, dim]
+        let xs = Tensor::randn(&[2, 3, 4], (Kind::Float, Device::Cpu));
+
+        let rearranged = module.rearrange(&xs);
+
+        // Expected output shape: [batch_size, dim, sequence_length, 1]
+        assert_eq!(rearranged.size(), vec![2, 4, 3, 1]);
+    }
+
+    #[test]
+    fn test_to_value_residual_mix_forward() {
+        let vs = VarStore::new(Device::Cpu);
+        let module = ToValueResidualMix::new(&vs.root(), 8, 4);
+
+        // Input tensor: [batch_size, sequence_length, dim]
+        let xs = Tensor::randn(&[2, 3, 8], (Kind::Float, Device::Cpu));
+
+        let output = module.forward(&xs);
+
+        // Expected output shape: [batch_size, heads, sequence_length, 1]
+        assert_eq!(output.size(), vec![2, 4, 3, 1]);
+    }
+
+    #[test]
+    fn test_to_vgates_rearrange() {
+        let vs = VarStore::new(Device::Cpu);
+        let to_vgates = ToVGates::new(&vs.root(), 4, 4);
+
+        // Input tensor: [batch_size, sequence_length, heads]
+        let xs = Tensor::randn(&[2, 3, 4], (Kind::Float, Device::Cpu));
+
+        let output = to_vgates.rearrange(&xs);
+
+        // Expected output shape: [batch_size, heads, sequence_length, 1]
+        assert_eq!(output.size(), vec![2, 4, 3, 1]);
+    }
+
+    #[test]
+    fn test_to_vgates_forward() {
+        let vs = VarStore::new(Device::Cpu);
+        let to_vgates = ToVGates::new(&vs.root(), 4, 4);
+
+        // Input tensor: [batch_size, sequence_length, heads]
+        let xs = Tensor::randn(&[2, 3, 4], (Kind::Float, Device::Cpu));
+
+        let output = to_vgates.forward(&xs);
+
+        // Expected output shape: [batch_size, heads, sequence_length, 1]
+        assert_eq!(output.size(), vec![2, 4, 3, 1]);
+    }
+
+    #[test]
+    fn test_to_out_rearrange() {
+        let vs = VarStore::new(Device::Cpu);
+        let to_out = ToOut::new(&vs.root(), 8, 4, 2, Some(0.1));
+
+        // Input tensor: [batch_size, sequence_length, heads, dim_head]
+        let xs = Tensor::randn(&[2, 3, 4, 2], (Kind::Float, Device::Cpu));
+
+        let output = to_out.rearrange(&xs);
+
+        // Expected output shape: [batch_size, sequence_length, heads * dim_head]
+        assert_eq!(output.size(), vec![2, 3, 8]);
+    }
+
+    #[test]
+    fn test_to_out_forward() {
+        let vs = VarStore::new(Device::Cpu);
+        let to_out = ToOut::new(&vs.root(), 8, 4, 2, Some(0.1));
+
+        // Input tensor: [batch_size, sequence_length, heads, dim_head]
+        let xs = Tensor::randn(&[2, 3, 4, 2], (Kind::Float, Device::Cpu));
+
+        let output = to_out.forward_t(&xs, false);
+
+        // Expected output shape: [batch_size, sequence_length, dim]
+        assert_eq!(output.size(), vec![2, 3, 8]);
     }
 
     // #[test]
