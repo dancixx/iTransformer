@@ -2,6 +2,19 @@
 name = "itransformer-rs"
 version = "1.0.0"
 edition = "2021"
+license = "MIT"
+description = "A Rust library for the iTransformer model."
+homepage = "https://github.com/rust-dd/iTransformer"
+repository = "https://github.com/rust-dd/iTransformer"
+documentation = "https://docs.rs/itransformer-rs/latest/itransformer_rs/"
+readme = "README.md"
+keywords = [
+    "iTransformer",
+    "transformer",
+    "tch-rs",
+    "deep_learning",
+    "timeseries",
+]
 
 [dependencies]
 either = "1.13.0"
