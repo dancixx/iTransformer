@@ -42,7 +42,7 @@ cargo add itransformer-rs
 
 ## 📝 **Usage**
 
-```bash
+```rust
 use tch::{Device, Tensor, nn::VarStore, Kind};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
