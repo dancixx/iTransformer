@@ -207,82 +207,89 @@ use tch::{
 //         }
 //     }
 // }
-//
-// pub struct PredHead {
-//     num_tokens_per_variate: usize,
-//     linear: Linear,
-// }
-//
-// impl PredHead {
-//     fn new(
-//         vb: &VarBuilder,
-//         idx: Option<usize>,
-//         dim: usize,
-//         one_pred_length: usize,
-//         num_tokens_per_variate: usize,
-//     ) -> Result<Self> {
-//         Ok(Self {
-//             num_tokens_per_variate,
-//             linear: linear(
-//                 dim * num_tokens_per_variate,
-//                 one_pred_length,
-//                 vb.pp(format!("head_{}_linear", idx.unwrap_or(0))),
-//             )?,
-//         })
-//     }
-// }
-//
-// impl Module for PredHead {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let n = self.num_tokens_per_variate;
-//         let b = xs.dim(0)?;
-//         let v = xs.dim(1)?;
-//         let d = xs.dim(2)?;
-//         // einsum 'b (v n) d -> b v (n d)', n = num_tokens_per_variate
-//         let xs = xs.reshape(&[b, v, n * d])?;
-//         let xs = self.linear.forward(&xs)?;
-//         // einsum 'b v n -> b n v'
-//         let xs = xs.transpose(1, 2)?;
-//         Ok(xs)
-//     }
-// }
-//
-// struct MlpIn {
-//     num_tokens_per_variate: usize,
-//     linear: Linear,
-//     layer_norm: LayerNorm,
-// }
-//
-// impl MlpIn {
-//     fn new(
-//         vb: &VarBuilder,
-//         dim: usize,
-//         hidden_size: usize,
-//         num_tokens_per_variate: usize,
-//     ) -> Result<Self> {
-//         Ok(Self {
-//             num_tokens_per_variate,
-//             linear: linear(dim, hidden_size, vb.pp("mlp_in_linear"))?,
-//             layer_norm: layer_norm(hidden_size, LayerNormConfig::default(), vb.pp("mlp_in_layernorm"))?,
-//         })
-//     }
-// }
-//
-// impl Module for MlpIn {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let xs = self.linear.forward(&xs)?;
-//         // einsum 'b v (n d) -> b (v n) d', n = num_tokens_per_variate
-//         let n = self.num_tokens_per_variate;
-//         let b = xs.dim(0)?;
-//         let v = xs.dim(1)?;
-//         let nd = xs.dim(2)?;
-//         let d = nd / n;
-//         let xs = xs.reshape(&[b, v * n, d])?;
-//         let xs = self.layer_norm.forward(&xs)?;
-//         Ok(xs)
-//     }
-// }
-//
+
+#[derive(Debug)]
+pub struct PredHead {
+    num_tokens_per_variate: i64,
+    linear: Linear,
+}
+
+impl PredHead {
+    fn new(vs: &Path, dim: i64, one_pred_length: i64, num_tokens_per_variate: i64) -> Result<Self> {
+        let in_dim = dim * num_tokens_per_variate;
+
+        Ok(Self {
+            num_tokens_per_variate,
+            linear: linear(vs, in_dim, one_pred_length, LinearConfig::default()),
+        })
+    }
+
+    fn rearrange_pre(&self, xs: &Tensor) -> Tensor {
+        // 'b (v n) d -> b v (n d)', n = num_tokens_per_variate
+        let xs_dims = xs.size();
+        let (b, vn, d) = (xs_dims[0], xs_dims[1], xs_dims[2]);
+        let v = vn / self.num_tokens_per_variate;
+        let n = self.num_tokens_per_variate;
+        let xs = xs.reshape(&[b, v, n, d]);
+        let xs = xs.reshape(&[b, v, n * d]);
+        xs
+    }
+
+    fn rearrange_post(&self, xs: &Tensor) -> Tensor {
+        // 'b v n -> b n v'
+        let xs = xs.permute(&[0, 2, 1]); // equivalent to xs.transpose(1, 2)
+        xs
+    }
+}
+
+impl Module for PredHead {
+    fn forward(&self, xs: &Tensor) -> Tensor {
+        let xs = self.rearrange_pre(&xs);
+        let xs = self.linear.forward(&xs);
+        let xs = self.rearrange_post(&xs);
+        xs
+    }
+}
+
+#[derive(Debug)]
+struct MlpIn {
+    num_tokens_per_variate: i64,
+    linear: Linear,
+    norm: LayerNorm,
+}
+
+impl MlpIn {
+    fn new(vs: &Path, dim: i64, num_tokens_per_variate: i64) -> Result<Self> {
+        let hidden_size = dim * num_tokens_per_variate;
+
+        Ok(Self {
+            num_tokens_per_variate,
+            linear: linear(vs, dim, hidden_size, LinearConfig::default()),
+            norm: layer_norm(vs, vec![dim], LayerNormConfig::default()),
+        })
+    }
+
+    fn rearrange(&self, xs: &Tensor) -> Tensor {
+        // einsum 'b v (n d) -> b (v n) d', n = num_tokens_per_variate
+        let xs_dims = xs.size();
+        let (b, v, nd) = (xs_dims[0], xs_dims[1], xs_dims[2]);
+        let n = self.num_tokens_per_variate;
+        let d = nd / n;
+        let xs = xs.reshape(&[b, v, n, d]);
+        let xs = xs.permute(&[0, 2, 1, 3]);
+        let xs = xs.reshape(&[b, n * v, d]);
+        xs
+    }
+}
+
+impl Module for MlpIn {
+    fn forward(&self, xs: &Tensor) -> Tensor {
+        let xs = self.linear.forward(&xs);
+        let xs = self.rearrange(&xs);
+        let xs = self.norm.forward(&xs);
+        xs
+    }
+}
 
 #[derive(Debug)]
 struct ToQKV {
@@ -356,7 +363,7 @@ impl ToValueResidualMix {
 
     fn rearrange(&self, xs: &Tensor) -> Tensor {
         // einsum: 'b n h -> b h n 1'
-        let xs = xs.permute(&[0, 2, 1]);
+        let xs = xs.permute(&[0, 2, 1]); // equivalent to xs.transpose(1, 2)
         let xs = xs.unsqueeze(-1);
         xs
     }
@@ -783,6 +790,7 @@ mod tests {
         let out = reverse_fn(&normalized).unwrap();
 
         assert_eq!(Tensor::allclose(&xs, &out, 1e-5, 1e-5, false), true);
+        println!("✅ Success! RevIn module executed successfully!");
     }
 
     #[test]
@@ -793,6 +801,7 @@ mod tests {
         let out = reverse_fn(&normalized).unwrap();
 
         assert_eq!(Tensor::allclose(&xs, &out, 1e-5, 1e-5, false), true);
+        println!("✅ Success! RevIn module executed successfully!");
     }
 
     #[test]
@@ -814,6 +823,7 @@ mod tests {
             .reshape(&[2, 2])
             .to_device(*DEVICE);
         assert_eq!(tensors[1], gate);
+        println!("✅ Success! GEGLU rearrange executed successfully!");
     }
 
     #[test]
@@ -825,6 +835,7 @@ mod tests {
 
         let geglu = GEGLU;
         let _ = geglu.forward(&xs);
+        println!("✅ Success! GEGLU module executed successfully!");
     }
 
     #[test]
@@ -833,6 +844,7 @@ mod tests {
         let xs = Tensor::randn(&[2, 512], (Kind::Float, *DEVICE));
         let feed_forward = FeedForward::new(&(vs.root() / "ff"), 512, 4, Some(0.1));
         let _ = feed_forward.forward_t(&xs, true);
+        println!("✅ Success! FeedForward module executed successfully!");
     }
 
     #[test]
@@ -872,6 +884,7 @@ mod tests {
 
         println!("Attention logit shape: {:?}", sim.size());
         println!("Attention output shape: {:?}", attn_output.size());
+        println!("✅ Success! Einsum operations completed successfully!");
     }
 
     #[test]
@@ -905,7 +918,7 @@ mod tests {
 
             match attend.forward_t(&q, &k, &v, true) {
                 Ok(result) => {
-                    println!("Success! Output shape: {:?}\n", result.size());
+                    println!("✅ Success! Output shape: {:?}\n", result.size());
                 }
                 Err(err) => {
                     eprintln!(
@@ -972,7 +985,7 @@ mod tests {
         assert_eq!(k, k_expected, "K tensor values mismatch");
         assert_eq!(v, v_expected, "V tensor values mismatch");
 
-        println!("Test passed: Q, K, and V tensors match the expected shapes and values!");
+        println!("✅ Test passed: Q, K, and V tensors match the expected shapes and values!");
     }
 
     #[test]
@@ -990,6 +1003,8 @@ mod tests {
         let vs = VarStore::new(*DEVICE);
         let to_qkv = ToQKV::new(&(vs.root() / "to_qkv"), total_dim, dim_head, h);
         let _ = to_qkv.forward(&xs);
+
+        println!("✅ ToQKV forward test passed!");
     }
 
     #[test]
@@ -1003,6 +1018,8 @@ mod tests {
 
         // Expected output shape: [batch_size, dim, sequence_length, 1]
         assert_eq!(rearranged.size(), vec![2, 4, 3, 1]);
+
+        println!("✅ ToValueResidualMix rearrange test passed!");
     }
 
     #[test]
@@ -1017,6 +1034,8 @@ mod tests {
 
         // Expected output shape: [batch_size, heads, sequence_length, 1]
         assert_eq!(output.size(), vec![2, 4, 3, 1]);
+
+        println!("✅ ToValueResidualMix forward test passed!");
     }
 
     #[test]
@@ -1031,6 +1050,8 @@ mod tests {
 
         // Expected output shape: [batch_size, heads, sequence_length, 1]
         assert_eq!(output.size(), vec![2, 4, 3, 1]);
+
+        println!("✅ ToVGates rearrange test passed!");
     }
 
     #[test]
@@ -1045,6 +1066,8 @@ mod tests {
 
         // Expected output shape: [batch_size, heads, sequence_length, 1]
         assert_eq!(output.size(), vec![2, 4, 3, 1]);
+
+        println!("✅ ToVGates forward test passed!");
     }
 
     #[test]
@@ -1059,6 +1082,8 @@ mod tests {
 
         // Expected output shape: [batch_size, sequence_length, heads * dim_head]
         assert_eq!(output.size(), vec![2, 3, 8]);
+
+        println!("✅ ToOut rearrange test passed!");
     }
 
     #[test]
@@ -1073,6 +1098,8 @@ mod tests {
 
         // Expected output shape: [batch_size, sequence_length, dim]
         assert_eq!(output.size(), vec![2, 3, 8]);
+
+        println!("✅ ToOut forward test passed!");
     }
 
     #[test]
@@ -1090,6 +1117,8 @@ mod tests {
             .expect("forward_t failed");
 
         println!("Output shape: {:?}", out.size());
+
+        println!("✅ Attention forward test passed!");
     }
 
     #[test]
@@ -1123,6 +1152,146 @@ mod tests {
 
         // 6. Print to string
         println!("{:?}", out.to_string(128));
+
+        println!("✅ Attention forward test passed!");
+    }
+
+    #[test]
+    fn test_mlp_in_rearrange() {
+        // Initialize MlpIn with num_tokens_per_variate = 2
+        let vs = VarStore::new(Device::Cpu);
+        let mlp_in = MlpIn::new(&vs.root(), 8, 2).expect("Failed to create MlpIn");
+
+        // Input Tensor: [batch_size=2, variates=3, tokens=4]
+        let data = (1..=2 * 3 * 4).map(|x| x as f32).collect::<Vec<_>>();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 3, 4])
+            .to_device(Device::Cpu);
+
+        println!("Input Tensor Shape: {:?}", xs.size());
+
+        // Perform rearrange
+        let rearranged = mlp_in.rearrange(&xs);
+
+        // Expected output shape: [batch_size=2, (v * n)=6, d=2]
+        assert_eq!(
+            rearranged.size(),
+            vec![2, 6, 2],
+            "Rearranged tensor shape mismatch"
+        );
+
+        println!("✅ Rearrange test passed!");
+    }
+
+    #[test]
+    fn test_mlp_in_forward() {
+        // Initialize MlpIn with num_tokens_per_variate = 2
+        let vs = VarStore::new(Device::Cpu);
+        let mlp_in = MlpIn::new(&vs.root(), 8, 2).expect("Failed to create MlpIn");
+
+        // Input Tensor: [batch_size=2, variates=3, tokens=8]
+        let data = (1..=2 * 3 * 8).map(|x| x as f32).collect::<Vec<_>>();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 3, 8])
+            .to_device(Device::Cpu);
+
+        println!("Input Tensor Shape: {:?}", xs.size());
+
+        // Perform forward pass
+        let output = mlp_in.forward(&xs);
+
+        // Expected output shape after rearrange: [batch_size=2, (v * n)=6, d=16]
+        assert_eq!(
+            output.size(),
+            vec![2, 6, 8],
+            "Forward tensor shape mismatch"
+        );
+
+        println!("✅ Forward test passed!");
+    }
+
+    #[test]
+    fn test_predhead_rearrange_pre() {
+        // Initialize PredHead with num_tokens_per_variate = 2
+        let vs = VarStore::new(Device::Cpu);
+        let pred_head = PredHead::new(&vs.root(), 4, 8, 2).expect("Failed to create PredHead");
+
+        // Input Tensor: [batch_size=2, (variates * tokens)=6, dim=4]
+        let data = (1..=2 * 6 * 4).map(|x| x as f32).collect::<Vec<_>>();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 6, 4])
+            .to_device(Device::Cpu);
+
+        println!("Input Tensor Shape: {:?}", xs.size());
+
+        // Rearrange Pre
+        let rearranged = pred_head.rearrange_pre(&xs);
+
+        // Expected output shape: [batch_size=2, variates=3, (tokens * dim)=8]
+        assert_eq!(
+            rearranged.size(),
+            vec![2, 3, 8],
+            "Rearranged_pre tensor shape mismatch"
+        );
+
+        println!("✅ Rearrange_pre test passed!");
+        println!("Rearranged Tensor: {:?}", rearranged);
+    }
+
+    #[test]
+    fn test_predhead_rearrange_post() {
+        // Initialize PredHead with num_tokens_per_variate = 2
+        let vs = VarStore::new(Device::Cpu);
+        let pred_head = PredHead::new(&vs.root(), 4, 8, 2).expect("Failed to create PredHead");
+
+        // Input Tensor: [batch_size=2, variates=3, tokens=4]
+        let data = (1..=2 * 3 * 4).map(|x| x as f32).collect::<Vec<_>>();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 3, 4])
+            .to_device(Device::Cpu);
+
+        println!("Input Tensor Shape: {:?}", xs.size());
+
+        // Rearrange Post
+        let rearranged = pred_head.rearrange_post(&xs);
+
+        // Expected output shape: [batch_size=2, tokens=4, variates=3]
+        assert_eq!(
+            rearranged.size(),
+            vec![2, 4, 3],
+            "Rearranged_post tensor shape mismatch"
+        );
+
+        println!("✅ Rearrange_post test passed!");
+        println!("Rearranged Tensor: {:?}", rearranged);
+    }
+
+    #[test]
+    fn test_predhead_forward() {
+        // Initialize PredHead with dim=4, one_pred_length=8, num_tokens_per_variate=2
+        let vs = VarStore::new(Device::Cpu);
+        let pred_head = PredHead::new(&vs.root(), 4, 8, 2).expect("Failed to create PredHead");
+
+        // Input Tensor: [batch_size=2, (variates * tokens)=6, dim=4]
+        let data = (1..=2 * 6 * 4).map(|x| x as f32).collect::<Vec<_>>();
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 6, 4])
+            .to_device(Device::Cpu);
+
+        println!("Input Tensor Shape: {:?}", xs.size());
+
+        // Perform forward pass
+        let output = pred_head.forward(&xs);
+
+        // Expected output shape after rearrange_post: [batch_size=2, one_pred_length=8, variates=3]
+        assert_eq!(
+            output.size(),
+            vec![2, 8, 3],
+            "Forward tensor shape mismatch"
+        );
+
+        println!("✅ Forward test passed!");
+        println!("Output Tensor: {:?}", output);
     }
 
     // #[test]
