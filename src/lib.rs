@@ -310,6 +310,7 @@ impl ToQKV {
         // einsum: rearrange 'b n (qkv h d) -> qkv b h n d', where qkv = 3 & h = heads
         // [b, n, 3 * heads * dim_head] -> [b, n, 3, heads, dim_head]
         let xs_dims = xs.size();
+
         let (h, qkv) = (self.heads, 3);
         let b = xs_dims[0];
         let n = xs_dims[1];
@@ -319,9 +320,9 @@ impl ToQKV {
         let xs = xs.permute(&[2, 0, 3, 1, 4]);
 
         let chunks = xs.chunk(qkv, 0);
-        let q = chunks[0].contiguous();
-        let k = chunks[1].contiguous();
-        let v = chunks[2].contiguous();
+        let q = chunks[0].squeeze();
+        let k = chunks[1].squeeze();
+        let v = chunks[2].squeeze();
 
         (q, k, v)
     }
@@ -437,7 +438,7 @@ impl ToOut {
     fn rearrange(&self, xs: &Tensor) -> Tensor {
         // einsum 'b n h d -> b n (h d)'
         let xs_dims = xs.size();
-        let (b, n, h, d) = (xs_dims[0], xs_dims[1], xs_dims[2], xs_dims[3]);
+        let (b, h, n, d) = (xs_dims[0], xs_dims[1], xs_dims[2], xs_dims[3]);
         let xs = xs.reshape(&[b, n, h * d]);
         xs
     }
@@ -479,7 +480,7 @@ impl Attention {
         let scale = (dim_head as f64).sqrt();
 
         let norm = layer_norm(vs, vec![dim], LayerNormConfig::default());
-        let to_qkv = ToQKV::new(vs, dim, dim_head, heads);
+        let to_qkv = ToQKV::new(vs, dim, dim_head * heads, heads);
         let to_value_residual_mix = if learned_value_residual_mix.unwrap_or(false) {
             Some(ToValueResidualMix::new(vs, dim, heads))
         } else {
@@ -511,16 +512,16 @@ impl Attention {
         let (q, k, mut v) = self.to_qkv.forward(&xs);
         let cache_v = v.copy();
 
-        if let Some(to_value_residual_mix) = &self.to_value_residual_mix {
+        if self.to_value_residual_mix.is_some() {
             if let Some(value_residual) = value_residual {
                 let mix = self.to_value_residual_mix.as_ref().unwrap().forward(&xs);
-                v = v.lerp(&value_residual, &mix);
+                v = v.lerp_tensor(&value_residual, &mix);
             }
         }
 
-        let out = self.attend.forward_t(&q, &k, &v, train);
+        let out = self.attend.forward_t(&q, &k, &v, train)?;
         let gates = self.to_v_gates.forward(&xs);
-        let out = out? * gates;
+        let out = out * gates;
         let out = self.to_out.forward_t(&out, train);
 
         Ok((out, cache_v))
@@ -1072,6 +1073,56 @@ mod tests {
 
         // Expected output shape: [batch_size, sequence_length, dim]
         assert_eq!(output.size(), vec![2, 3, 8]);
+    }
+
+    #[test]
+    fn test_attention_forward_t_v1() {
+        // 1. Prepare the VarStore and create Attention
+        let vs = VarStore::new(Device::Cpu);
+        let attention = Attention::new(&vs.root(), 256, None, None, None, Some(false), Some(false));
+
+        // 2. Input Tensor: [batch_size=2, seq_len=3, dim=256]
+        let xs = Tensor::randn(&[2, 3, 256], (Kind::Float, Device::Cpu));
+
+        // 3. Forward pass
+        let (out, ..) = attention
+            .forward_t(&xs, None, false)
+            .expect("forward_t failed");
+
+        println!("Output shape: {:?}", out.size());
+    }
+
+    #[test]
+    fn test_attention_forward_t_v2() {
+        // 1. Prepare the VarStore and create Attention
+        let vs = VarStore::new(Device::Cpu);
+        let attention = Attention::new(&vs.root(), 256, None, None, None, Some(false), Some(false));
+
+        // 2. Static Input Tensor: [batch_size=2, seq_len=3, dim=256]
+        // Instead of random values, we'll use a static, known set of numbers.
+        let data = (1..=2 * 3 * 256).map(|x| x as f32).collect::<Vec<_>>();
+
+        let xs = Tensor::from_slice(&data)
+            .reshape(&[2, 3, 256])
+            .to_device(Device::Cpu);
+
+        // Print the static tensor for verification (optional)
+        println!("Input Tensor: {:?}", xs);
+
+        // 3. Forward pass
+        let (out, ..) = attention
+            .forward_t(&xs, None, false)
+            .expect("forward_t failed");
+
+        // 4. Validate Output Shape
+        println!("Output shape: {:?}", out.size());
+        assert_eq!(out.size(), vec![2, 3, 256], "Output shape mismatch");
+
+        // 5. Print Output Tensor (optional)
+        println!("Output Tensor: {:?}", out);
+
+        // 6. Print to string
+        println!("{:?}", out.to_string(128));
     }
 
     // #[test]
