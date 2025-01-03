@@ -37,7 +37,8 @@ impl ITransformer {
         ff_mult: Option<i64>,
         ff_drop_p: Option<f64>,
         num_mem_tokens: Option<i64>,
-        num_residual_streams: Option<usize>,
+        // TODO: related to hyper-connections
+        // num_residual_streams: Option<usize>,
         use_reversible_instance_norm: Option<bool>,
         reversible_instance_norm_affine: Option<bool>,
         flash_attn: bool,
@@ -50,6 +51,7 @@ impl ITransformer {
         let ff_mult = ff_mult.unwrap_or(4);
         let ff_dropout = ff_drop_p.unwrap_or(0.0);
         let num_mem_tokens = num_mem_tokens.unwrap_or(4);
+        // TODO: related to hyper-connections
         // let num_residual_streams = num_residual_streams.unwrap_or(4);
         let use_reversible_instance_norm = use_reversible_instance_norm.unwrap_or(false);
         let reversible_instance_norm_affine = reversible_instance_norm_affine.unwrap_or(true);
