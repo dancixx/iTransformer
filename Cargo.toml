@@ -1,12 +1,12 @@
 [package]
-name = "itransformer-rs"
+name = "itransformer"
 version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "A Rust library for the iTransformer model."
 homepage = "https://github.com/rust-dd/iTransformer"
 repository = "https://github.com/rust-dd/iTransformer"
-documentation = "https://docs.rs/itransformer-rs/latest/itransformer_rs/"
+documentation = "https://docs.rs/itransformer/latest/itransformer/"
 readme = "README.md"
 keywords = [
     "iTransformer",
