@@ -1,212 +1,211 @@
 use either::Either;
 use tch::{
     nn::{
-        layer_norm, linear, LayerNorm, LayerNormConfig, Linear, LinearConfig, Module, ModuleT, Path,
+        layer_norm, linear, Init, LayerNorm, LayerNormConfig, Linear, LinearConfig, Module,
+        ModuleT, Path,
     },
     Device, Kind, Result, Tensor,
 };
 
-// pub struct ITransformer {
-//     num_variates: usize,
-//     lookback_len: usize,
-//     pred_length: Vec<usize>,
-//     num_tokens_per_variate: usize,
-//     mem_tokens: Option<Tensor>,
-//     reversible_instance_norm: Option<RevIn>,
-//     // expand_streams: HyperStream,
-//     // reduce_streams: HyperStream,
-//     layers: Vec<(Attention, FeedForward)>,
-//     mlp_in: MlpIn,
-//     pred_heads: Vec<PredHead>,
-// }
-//
-// impl ITransformer {
-//     pub fn new(
-//         vb: &VarBuilder,
-//         num_variates: usize,
-//         lookback_len: usize,
-//         depth: usize,
-//         dim: usize,
-//         num_tokens_per_variate: Option<usize>,
-//         pred_length: Vec<usize>,
-//         dim_head: Option<usize>,
-//         heads: Option<usize>,
-//         attn_dropout: Option<f32>,
-//         ff_mult: Option<usize>,
-//         ff_dropout: Option<f32>,
-//         num_mem_tokens: Option<usize>,
-//         // num_residual_streams: Option<usize>,
-//         use_reversible_instance_norm: Option<bool>,
-//         reversible_instance_norm_affine: Option<bool>,
-//         flash_attn: bool,
-//         device: &Device,
-//     ) -> Result<Self> {
-//         let num_tokens_per_variate = num_tokens_per_variate.unwrap_or(1);
-//         let dim_head = dim_head.unwrap_or(32);
-//         let heads = heads.unwrap_or(4);
-//         let attn_dropout = attn_dropout.unwrap_or(0.0);
-//         let ff_mult = ff_mult.unwrap_or(4);
-//         let ff_dropout = ff_dropout.unwrap_or(0.0);
-//         let num_mem_tokens = num_mem_tokens.unwrap_or(4);
-//         // let num_residual_streams = num_residual_streams.unwrap_or(4);
-//         let use_reversible_instance_norm = use_reversible_instance_norm.unwrap_or(false);
-//         let reversible_instance_norm_affine = reversible_instance_norm_affine.unwrap_or(true);
-//
-//         let mem_tokens = if num_mem_tokens > 0 {
-//             Some(Tensor::randn(0.0f32, 1.0f32, (num_mem_tokens, dim), device)?)
-//         } else {
-//             None
-//         };
-//
-//         let reversible_instance_norm = if use_reversible_instance_norm {
-//             Some(RevIn::new(
-//                 num_variates,
-//                 Some(reversible_instance_norm_affine),
-//                 None,
-//                 device
-//             )?)
-//         } else {
-//             None
-//         };
-//
-//         let mut layers = Vec::with_capacity(depth);
-//
-//         for idx in 0..depth {
-//             let attn = Attention::new(
-//                 vb,
-//                 Some(idx),
-//                 dim,
-//                 Some(dim_head),
-//                 Some(heads),
-//                 Some(attn_dropout),
-//                 Some(flash_attn),
-//                 None,
-//                 None,
-//                 &device
-//             )?;
-//             let ff = FeedForward::new(vb, Some(idx), dim, ff_mult, Some(ff_dropout), None)?;
-//             layers.push((attn, ff));
-//         }
-//
-//         let mlp_in = MlpIn::new(
-//             &vb,
-//             lookback_len,
-//             dim * num_tokens_per_variate,
-//             num_tokens_per_variate,
-//         )?;
-//         let mut pred_heads = Vec::with_capacity(pred_length.len());
-//         for (idx, pl) in pred_length.iter().enumerate() {
-//             pred_heads.push(PredHead::new(
-//                 vb,
-//                 Some(idx),
-//                 dim,
-//                 *pl,
-//                 num_tokens_per_variate,
-//             )?);
-//         }
-//
-//         Ok(Self {
-//             num_variates,
-//             lookback_len,
-//             pred_length,
-//             num_tokens_per_variate,
-//             mem_tokens,
-//             reversible_instance_norm,
-//             mlp_in,
-//             pred_heads,
-//             layers,
-//         })
-//     }
-//
-//     fn forward(
-//         &self,
-//         xs: &Tensor,
-//         targets: Option<&Vec<Tensor>>,
-//     ) -> Result<Either<Vec<(usize, Tensor)>, f64>> {
-//         // einstein notation
-//         // b: batch size
-//         // n: time
-//         // v: variate
-//         // t: num tokens per variate
-//         let t = self.num_tokens_per_variate;
-//         let has_mem = self.mem_tokens.is_some();
-//         assert_eq!(xs.dims()[1..], [self.lookback_len, self.num_variates]);
-//
-//         // einsum 'b n v -> b v n'
-//         let xs = xs.transpose(1, 2)?;
-//         let mut revin: Option<RevInResult> = None;
-//
-//         if let Some(ref reversible_instance_norm) = &self.reversible_instance_norm {
-//             let result = reversible_instance_norm.to_owned();
-//             let result = result.forward(&xs, Some(false));
-//             revin = Some(result);
-//         };
-//
-//         let (xs, reverse_fn, ..) = revin.unwrap()?;
-//         let mut xs = self.mlp_in.forward(&xs)?;
-//         let mut mem_ps = 0;
-//
-//         if has_mem {
-//             let mem_tokens = self.mem_tokens.as_ref().unwrap();
-//             let b = xs.dim(0)?; // batch-méret
-//             let m = mem_tokens.dim(0)?;
-//             let d = mem_tokens.dim(1)?;
-//
-//             let repeated = mem_tokens
-//               .unsqueeze(0)?
-//               .repeat(&[b, 1, 1])?.to_dtype(DType::F32)?;
-//             mem_ps = repeated.dim(1)?;
-//             xs = Tensor::cat(&[repeated, xs.clone()], 1)?;
-//         }
-//
-//         for (attn, ff) in &self.layers {
-//             let (attn_out, ..) = attn.forward(&xs, self.mem_tokens.as_ref())?;
-//             let xs_ = &xs + attn_out;
-//             let xs_ = ff.forward(&xs_?)?;
-//             xs = xs_
-//         }
-//
-//         if has_mem {
-//             let b = xs.dim(1)?;
-//             let total_tokens = xs.dim(1)?;
-//             let d = xs.dim(2)?;
-//             xs = xs.narrow(1, mem_ps, total_tokens - mem_ps)?;
-//         }
-//
-//         if self.reversible_instance_norm.is_some() {
-//             // einops 'b (n t) d -> t b n d
-//             let xs_ = xs
-//                 .reshape(&[t, xs.dim(0)?, xs.dim(1)? / t, xs.dim(2)?])?
-//                 .transpose(0, 1)?;
-//             let xs_ = reverse_fn(&xs_)?;
-//             // einops 't b n d -> b (n t) d'
-//             let xs_ = xs_
-//                 .transpose(0, 1)?
-//                 .reshape(&[xs.dim(1)?, xs.dim(2)? * t, xs.dim(3)?])?;
-//             xs = xs_
-//         }
-//
-//         let mut preds = Vec::with_capacity(self.pred_heads.len());
-//         for pred_head in &self.pred_heads {
-//             let pred = pred_head.forward(&xs)?;
-//             preds.push(pred);
-//         }
-//
-//         if let Some(targets) = targets {
-//             let mut mse_loss = 0.0;
-//             for (target, pred) in targets.iter().zip(&preds) {
-//                 assert_eq!(target.dims(), pred.dims());
-//                 // mse_loss = mse_loss + (target - pred)?.powf(2.0)?.into_iter().sum()?;
-//             }
-//
-//             Ok(Either::Right(mse_loss))
-//         } else {
-//             let result = self.pred_length.clone();
-//             let result = result.into_iter().zip(preds).collect::<Vec<_>>();
-//             Ok(Either::Left(result))
-//         }
-//     }
-// }
+#[derive(Debug)]
+pub struct ITransformer {
+    num_variates: i64,
+    lookback_len: i64,
+    pred_length: Vec<i64>,
+    num_tokens_per_variate: i64,
+    mem_tokens: Option<Tensor>,
+    reversible_instance_norm: Option<RevIn>,
+    // expand_streams: HyperStream,
+    // reduce_streams: HyperStream,
+    layers: Vec<(Attention, FeedForward)>,
+    mlp_in: MlpIn,
+    pred_heads: Vec<PredHead>,
+}
+
+impl ITransformer {
+    pub fn new(
+        vs: &Path,
+        num_variates: i64,
+        lookback_len: i64,
+        depth: i64,
+        dim: i64,
+        num_tokens_per_variate: Option<i64>,
+        pred_length: Vec<i64>,
+        dim_head: Option<i64>,
+        heads: Option<i64>,
+        attn_drop_p: Option<f64>,
+        ff_mult: Option<i64>,
+        ff_drop_p: Option<f64>,
+        num_mem_tokens: Option<i64>,
+        num_residual_streams: Option<usize>,
+        use_reversible_instance_norm: Option<bool>,
+        reversible_instance_norm_affine: Option<bool>,
+        flash_attn: bool,
+        device: &Device,
+    ) -> Result<Self> {
+        let num_tokens_per_variate = num_tokens_per_variate.unwrap_or(1);
+        let dim_head = dim_head.unwrap_or(32);
+        let heads = heads.unwrap_or(4);
+        let attn_dropout = attn_drop_p.unwrap_or(0.0);
+        let ff_mult = ff_mult.unwrap_or(4);
+        let ff_dropout = ff_drop_p.unwrap_or(0.0);
+        let num_mem_tokens = num_mem_tokens.unwrap_or(4);
+        // let num_residual_streams = num_residual_streams.unwrap_or(4);
+        let use_reversible_instance_norm = use_reversible_instance_norm.unwrap_or(false);
+        let reversible_instance_norm_affine = reversible_instance_norm_affine.unwrap_or(true);
+
+        // nn.Parameter(torch.randn(num_mem_tokens, dim))
+        let mem_tokens = (num_mem_tokens > 0).then_some(vs.var(
+            "itransformer_mem_tokens",
+            &[num_mem_tokens, dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 1.0,
+            },
+        ));
+
+        let reversible_instance_norm = use_reversible_instance_norm.then_some(RevIn::new(
+            num_variates,
+            Some(reversible_instance_norm_affine),
+            None,
+            device,
+        )?);
+
+        // TODO: implement https://pypi.org/project/hyper-connections/
+        // init_hyper_conn, self.expand_streams, self.reduce_streams = HyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
+        let mut layers = Vec::with_capacity(depth as usize);
+        for idx in 0..depth {
+            let is_first = idx == 0;
+            let learned_value_residual_mix = !is_first;
+
+            let attn = Attention::new(
+                vs,
+                dim,
+                Some(dim_head),
+                Some(heads),
+                Some(attn_dropout),
+                Some(flash_attn),
+                Some(learned_value_residual_mix),
+            );
+            let ff = FeedForward::new(vs, dim, ff_mult, Some(ff_dropout));
+            layers.push((attn, ff));
+        }
+
+        let mlp_in = MlpIn::new(
+            vs,
+            lookback_len,
+            dim * num_tokens_per_variate,
+            num_tokens_per_variate,
+        )?;
+
+        let mut pred_heads = Vec::with_capacity(pred_length.len());
+        for pl in &pred_length {
+            pred_heads.push(PredHead::new(vs, dim, *pl, num_tokens_per_variate)?);
+        }
+
+        Ok(Self {
+            num_variates,
+            lookback_len,
+            pred_length,
+            num_tokens_per_variate,
+            mem_tokens,
+            reversible_instance_norm,
+            mlp_in,
+            pred_heads,
+            layers,
+        })
+    }
+
+    // fn forward(
+    //     &self,
+    //     xs: &Tensor,
+    //     targets: Option<&Vec<Tensor>>,
+    // ) -> Result<Either<Vec<(usize, Tensor)>, f64>> {
+    //     // einstein notation
+    //     // b: batch size
+    //     // n: time
+    //     // v: variate
+    //     // t: num tokens per variate
+    //     let t = self.num_tokens_per_variate;
+    //     let has_mem = self.mem_tokens.is_some();
+    //     assert_eq!(xs.dims()[1..], [self.lookback_len, self.num_variates]);
+
+    //     // einsum 'b n v -> b v n'
+    //     let xs = xs.transpose(1, 2)?;
+    //     let mut revin: Option<RevInResult> = None;
+
+    //     if let Some(ref reversible_instance_norm) = &self.reversible_instance_norm {
+    //         let result = reversible_instance_norm.to_owned();
+    //         let result = result.forward(&xs, Some(false));
+    //         revin = Some(result);
+    //     };
+
+    //     let (xs, reverse_fn, ..) = revin.unwrap()?;
+    //     let mut xs = self.mlp_in.forward(&xs)?;
+    //     let mut mem_ps = 0;
+
+    //     if has_mem {
+    //         let mem_tokens = self.mem_tokens.as_ref().unwrap();
+    //         let b = xs.dim(0)?; // batch-méret
+    //         let m = mem_tokens.dim(0)?;
+    //         let d = mem_tokens.dim(1)?;
+
+    //         let repeated = mem_tokens
+    //             .unsqueeze(0)?
+    //             .repeat(&[b, 1, 1])?
+    //             .to_dtype(DType::F32)?;
+    //         mem_ps = repeated.dim(1)?;
+    //         xs = Tensor::cat(&[repeated, xs.clone()], 1)?;
+    //     }
+
+    //     for (attn, ff) in &self.layers {
+    //         let (attn_out, ..) = attn.forward(&xs, self.mem_tokens.as_ref())?;
+    //         let xs_ = &xs + attn_out;
+    //         let xs_ = ff.forward(&xs_?)?;
+    //         xs = xs_
+    //     }
+
+    //     if has_mem {
+    //         let b = xs.dim(1)?;
+    //         let total_tokens = xs.dim(1)?;
+    //         let d = xs.dim(2)?;
+    //         xs = xs.narrow(1, mem_ps, total_tokens - mem_ps)?;
+    //     }
+
+    //     if self.reversible_instance_norm.is_some() {
+    //         // einops 'b (n t) d -> t b n d
+    //         let xs_ = xs
+    //             .reshape(&[t, xs.dim(0)?, xs.dim(1)? / t, xs.dim(2)?])?
+    //             .transpose(0, 1)?;
+    //         let xs_ = reverse_fn(&xs_)?;
+    //         // einops 't b n d -> b (n t) d'
+    //         let xs_ = xs_
+    //             .transpose(0, 1)?
+    //             .reshape(&[xs.dim(1)?, xs.dim(2)? * t, xs.dim(3)?])?;
+    //         xs = xs_
+    //     }
+
+    //     let mut preds = Vec::with_capacity(self.pred_heads.len());
+    //     for pred_head in &self.pred_heads {
+    //         let pred = pred_head.forward(&xs)?;
+    //         preds.push(pred);
+    //     }
+
+    //     if let Some(targets) = targets {
+    //         let mut mse_loss = 0.0;
+    //         for (target, pred) in targets.iter().zip(&preds) {
+    //             assert_eq!(target.dims(), pred.dims());
+    //             // mse_loss = mse_loss + (target - pred)?.powf(2.0)?.into_iter().sum()?;
+    //         }
+
+    //         Ok(Either::Right(mse_loss))
+    //     } else {
+    //         let result = self.pred_length.clone();
+    //         let result = result.into_iter().zip(preds).collect::<Vec<_>>();
+    //         Ok(Either::Left(result))
+    //     }
+    // }
+}
 
 #[derive(Debug)]
 pub struct PredHead {
@@ -259,12 +258,12 @@ struct MlpIn {
 }
 
 impl MlpIn {
-    fn new(vs: &Path, dim: i64, num_tokens_per_variate: i64) -> Result<Self> {
+    fn new(vs: &Path, dim: i64, lookback_len: i64, num_tokens_per_variate: i64) -> Result<Self> {
         let hidden_size = dim * num_tokens_per_variate;
 
         Ok(Self {
             num_tokens_per_variate,
-            linear: linear(vs, dim, hidden_size, LinearConfig::default()),
+            linear: linear(vs, lookback_len, hidden_size, LinearConfig::default()),
             norm: layer_norm(vs, vec![dim], LayerNormConfig::default()),
         })
     }
@@ -460,6 +459,7 @@ impl ModuleT for ToOut {
     }
 }
 
+#[derive(Debug)]
 struct Attention {
     scale: f64,
     drop_p: f64,
@@ -690,7 +690,7 @@ struct Statistics {
 
 /// A reversible instance normalization module.
 /// https://openreview.net/forum?id=cGDAkQo1C0p
-// #[derive(Clone)]
+#[derive(Debug)]
 struct RevIn {
     num_variants: i64,
     eps: f64,
@@ -931,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rearrange() {
+    fn test_to_qkv_rearrange() {
         // Test Parameters
         let b = 2; // Batch size
         let n = 3; // Sequence length
@@ -954,9 +954,9 @@ mod tests {
         let (q, k, v) = to_qkv.rearrange(&xs);
 
         // Expected shapes
-        let expected_q_shape = [1, b, h, n, dim_head];
-        let expected_k_shape = [1, b, h, n, dim_head];
-        let expected_v_shape = [1, b, h, n, dim_head];
+        let expected_q_shape = [b, h, n, dim_head];
+        let expected_k_shape = [b, h, n, dim_head];
+        let expected_v_shape = [b, h, n, dim_head];
 
         assert_eq!(q.size(), expected_q_shape, "Q tensor shape mismatch");
         assert_eq!(k.size(), expected_k_shape, "K tensor shape mismatch");
@@ -981,9 +981,9 @@ mod tests {
             .slice(0, 2, 3, 1)
             .contiguous();
 
-        assert_eq!(q, q_expected, "Q tensor values mismatch");
-        assert_eq!(k, k_expected, "K tensor values mismatch");
-        assert_eq!(v, v_expected, "V tensor values mismatch");
+        assert_eq!(q, q_expected.squeeze(), "Q tensor values mismatch");
+        assert_eq!(k, k_expected.squeeze(), "K tensor values mismatch");
+        assert_eq!(v, v_expected.squeeze(), "V tensor values mismatch");
 
         println!("✅ Test passed: Q, K, and V tensors match the expected shapes and values!");
     }
@@ -1076,7 +1076,7 @@ mod tests {
         let to_out = ToOut::new(&vs.root(), 8, 4, 2, Some(0.1));
 
         // Input tensor: [batch_size, sequence_length, heads, dim_head]
-        let xs = Tensor::randn(&[2, 3, 4, 2], (Kind::Float, Device::Cpu));
+        let xs = Tensor::randn(&[2, 4, 3, 2], (Kind::Float, Device::Cpu));
 
         let output = to_out.rearrange(&xs);
 
@@ -1092,7 +1092,7 @@ mod tests {
         let to_out = ToOut::new(&vs.root(), 8, 4, 2, Some(0.1));
 
         // Input tensor: [batch_size, sequence_length, heads, dim_head]
-        let xs = Tensor::randn(&[2, 3, 4, 2], (Kind::Float, Device::Cpu));
+        let xs = Tensor::randn(&[2, 4, 3, 2], (Kind::Float, Device::Cpu));
 
         let output = to_out.forward_t(&xs, false);
 
@@ -1160,7 +1160,7 @@ mod tests {
     fn test_mlp_in_rearrange() {
         // Initialize MlpIn with num_tokens_per_variate = 2
         let vs = VarStore::new(Device::Cpu);
-        let mlp_in = MlpIn::new(&vs.root(), 8, 2).expect("Failed to create MlpIn");
+        let mlp_in = MlpIn::new(&vs.root(), 8, 12, 2).expect("Failed to create MlpIn");
 
         // Input Tensor: [batch_size=2, variates=3, tokens=4]
         let data = (1..=2 * 3 * 4).map(|x| x as f32).collect::<Vec<_>>();
@@ -1187,7 +1187,7 @@ mod tests {
     fn test_mlp_in_forward() {
         // Initialize MlpIn with num_tokens_per_variate = 2
         let vs = VarStore::new(Device::Cpu);
-        let mlp_in = MlpIn::new(&vs.root(), 8, 2).expect("Failed to create MlpIn");
+        let mlp_in = MlpIn::new(&vs.root(), 8, 8, 2).expect("Failed to create MlpIn");
 
         // Input Tensor: [batch_size=2, variates=3, tokens=8]
         let data = (1..=2 * 3 * 8).map(|x| x as f32).collect::<Vec<_>>();
@@ -1200,7 +1200,7 @@ mod tests {
         // Perform forward pass
         let output = mlp_in.forward(&xs);
 
-        // Expected output shape after rearrange: [batch_size=2, (v * n)=6, d=16]
+        // Expected output shape after rearrange: [batch_size=2, (v * n)=6, d=12]
         assert_eq!(
             output.size(),
             vec![2, 6, 8],
@@ -1208,6 +1208,7 @@ mod tests {
         );
 
         println!("✅ Forward test passed!");
+        println!("Output Tensor Shape: {:?}", output.size());
     }
 
     #[test]
