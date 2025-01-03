@@ -833,45 +833,77 @@ mod tests {
 
     #[test]
     fn test_geglu_rearrange() {
-        let data = (1..=8).collect::<Vec<_>>();
+        let data = (1..=16).collect::<Vec<_>>();
         let xs = Tensor::from_slice(&data)
-            .reshape(&[2, 4])
+            .reshape(&[2, 2, 4]) // [batch, sequence, features]
             .to_device(*DEVICE);
 
         let geglu = GEGLU;
         let (x, gate) = geglu.rearrange(&xs);
 
-        let x_ = Tensor::from_slice(&[1, 2, 5, 6])
-            .reshape(&[2, 2])
+        // Expected X tensor
+        let x_ = Tensor::from_slice(&[1, 2, 5, 6, 9, 10, 13, 14])
+            .reshape(&[2, 2, 2]) // [batch, sequence, features/2]
             .to_device(*DEVICE);
-        assert_eq!(x, x_);
 
-        let gate_ = Tensor::from_slice(&[3, 4, 7, 8])
-            .reshape(&[2, 2])
+        assert!(
+            x.allclose(&x_, 1e-6, 1e-6, false),
+            "X tensor does not match the expected tensor!"
+        );
+
+        // Expected Gate tensor
+        let gate_ = Tensor::from_slice(&[3, 4, 7, 8, 11, 12, 15, 16])
+            .reshape(&[2, 2, 2]) // [batch, sequence, features/2]
             .to_device(*DEVICE);
-        assert_eq!(gate, gate_);
+
+        assert!(
+            gate.allclose(&gate_, 1e-6, 1e-6, false),
+            "Gate tensor does not match the expected tensor!"
+        );
+
         println!("✅ Success! GEGLU rearrange executed successfully!");
     }
 
     #[test]
     fn test_geglu_forward() {
-        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
         let xs = Tensor::from_slice(&data)
-            .reshape(&[2, 4])
+            .reshape(&[2, 2, 4]) // [batch, sequence, features]
             .to_device(*DEVICE);
 
         let geglu = GEGLU;
-        let _ = geglu.forward(&xs);
-        println!("✅ Success! GEGLU module executed successfully!");
+        let output = geglu.forward(&xs);
+
+        // Ellenőrizzük a méretet
+        assert_eq!(output.size(), vec![2, 2, 2], "Output mérete hibás!");
+
+        println!("Output Tensor: {:?}", output);
+        println!("✅ Success! GEGLU forward executed successfully!");
     }
 
     #[test]
     fn test_feed_forward() {
         let vs = VarStore::new(*DEVICE);
-        let xs = Tensor::randn(&[2, 512], (Kind::Float, *DEVICE));
+
+        // Create a 3D tensor: [batch_size, seq_length, feature_dim]
+        let xs = Tensor::randn(&[2, 10, 512], (Kind::Float, *DEVICE));
+
+        // Initialize FeedForward module
         let feed_forward = FeedForward::new(&(vs.root() / "ff"), 512, 4, Some(0.1));
-        let _ = feed_forward.forward_t(&xs, true);
-        println!("✅ Success! FeedForward module executed successfully!");
+
+        // Forward pass
+        let output = feed_forward.forward_t(&xs, true);
+
+        // Validate output shape
+        assert_eq!(
+            output.size(),
+            vec![2, 10, 512],
+            "The output tensor does not have the expected shape [2, 10, 512]"
+        );
+
+        println!("✅ Success! FeedForward module executed successfully with 3D tensor!");
     }
 
     #[test]
