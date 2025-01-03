@@ -93,12 +93,7 @@ impl ITransformer {
             layers.push((attn, ff));
         }
 
-        let mlp_in = MlpIn::new(
-            vs,
-            lookback_len,
-            dim * num_tokens_per_variate,
-            num_tokens_per_variate,
-        )?;
+        let mlp_in = MlpIn::new(vs, dim, lookback_len, num_tokens_per_variate)?;
 
         let mut pred_heads = Vec::with_capacity(pred_length.len());
         for pl in &pred_length {
@@ -141,19 +136,18 @@ impl ITransformer {
             let result = reversible_instance_norm.forward(&xs, Some(false))?;
             revin = Some(result);
         };
-
-        let (xs, reverse_fn, ..) = revin.unwrap();
-        let mut xs = self.mlp_in.forward(&xs);
-        let mut mem_ps = 0;
+        let (xs, reverse_fn, ..) = revin.unwrap_or((Some(xs), None, None));
+        let mut xs = self.mlp_in.forward(xs.as_ref().unwrap());
+        let mut mem_ps = Vec::new();
 
         if has_mem {
             let mem_tokens = self.mem_tokens.as_ref().unwrap();
 
             // einsum m = repeat(self.mem_tokens, 'm d -> b m d', b = x.shape[0])
             let b = xs.size()[0];
-            let mem_tokens = mem_tokens.unsqueeze(0).repeat(&[b, -1, -1]);
+            let mem_tokens = mem_tokens.unsqueeze(0).repeat(&[b, 1, 1]);
+            mem_ps = vec![mem_tokens.size()[1], xs.size()[1]];
             xs = Tensor::cat(&[&mem_tokens, &xs], 1);
-            mem_ps = mem_tokens.size()[1];
         }
 
         let mut first_values: Option<Tensor> = None;
@@ -171,8 +165,7 @@ impl ITransformer {
 
         if has_mem {
             // _, x = unpack(x, mem_ps, 'b * d')
-            let splits = xs.split(mem_ps, 1);
-            xs = splits[1].shallow_clone();
+            xs = xs.narrow(1, mem_ps[0], mem_ps[1]);
         }
 
         if self.reversible_instance_norm.is_some() {
@@ -184,7 +177,7 @@ impl ITransformer {
             // rearrange(x, 'b (n t) d -> t b n d', t = t)
             let xs_ = xs.reshape(&[b, n, t, d]);
             let xs_ = xs_.permute(&[2, 0, 1, 3]);
-            let xs_ = reverse_fn(&xs_)?;
+            let xs_ = reverse_fn.unwrap()(&xs_)?;
             // rearrange(x, 't b n d -> b (n t) d', t = t)
             let xs_ = xs_.permute(&[1, 2, 0, 3]);
             let xs_ = xs_.reshape(&[b, nt, d]);
@@ -575,22 +568,21 @@ struct GEGLU;
 
 impl Module for GEGLU {
     fn forward(&self, xs: &Tensor) -> Tensor {
-        let tensors = self.rearrange(xs);
-        let gate = tensors[1].gelu("none");
+        let (x, gate) = self.rearrange(xs);
+        let gate = gate.gelu("none");
         // TODO: find a way to avoid cloning the variables
-        let x = tensors[0].copy();
         x * gate
     }
 }
 
 impl GEGLU {
-    fn rearrange(&self, xs: &Tensor) -> Vec<Tensor> {
-        let last_dim = xs.size();
-        let last_dim = last_dim[last_dim.len() - 1];
+    fn rearrange(&self, xs: &Tensor) -> (Tensor, Tensor) {
+        let xs_dims = xs.size();
+        let (b, n, d) = (xs_dims[0], xs_dims[1], xs_dims[2]);
         // x, gate = rearrange(x, '... (r d) -> r ... d', r = 2)
-        let reshaped = xs.view([-1, 2, last_dim / 2]);
-        let tensors = reshaped.unbind(1);
-        tensors
+        let reshaped = xs.reshape(&[b, n, 2, d / 2]);
+        let tensors = reshaped.unbind(2);
+        (tensors[0].copy(), tensors[1].copy())
     }
 }
 
@@ -605,7 +597,7 @@ struct FeedForward {
 
 impl FeedForward {
     fn new(vs: &Path, dim: i64, mult: i64, drop_p: Option<f64>) -> Self {
-        let hidden_size = (dim as f64 * mult as f64 * 2.0 / 3.0).round() as i64;
+        let hidden_size = (dim as f64 * mult as f64 * 2.0 / 3.0).trunc() as i64;
         let norm = layer_norm(vs, vec![dim], LayerNormConfig::default());
         let linear1 = linear(vs, dim, hidden_size * 2, Default::default());
         let linear2 = linear(vs, hidden_size, dim, Default::default());
@@ -758,8 +750,8 @@ impl RevIn {
         xs: &Tensor,
         return_statistics: Option<bool>,
     ) -> Result<(
-        Tensor,
-        Box<dyn FnOnce(&Tensor) -> Result<Tensor> + '_>,
+        Option<Tensor>,
+        Option<Box<dyn FnOnce(&Tensor) -> Result<Tensor> + '_>>,
         Option<Statistics>,
     )> {
         assert_eq!(xs.size()[1] == self.num_variants, true);
@@ -795,7 +787,7 @@ impl RevIn {
             });
         }
 
-        Ok((rescaled, Box::new(reverse_fn), statistics))
+        Ok((Some(rescaled), Some(Box::new(reverse_fn)), statistics))
     }
 }
 
@@ -822,7 +814,7 @@ mod tests {
             .to_device(*DEVICE);
         let rev_in = RevIn::new(4, None, None, &DEVICE).unwrap();
         let (normalized, reverse_fn, _) = rev_in.forward(&xs, Some(true)).unwrap();
-        let out = reverse_fn(&normalized).unwrap();
+        let out = reverse_fn.unwrap()(&normalized.unwrap()).unwrap();
 
         assert_eq!(Tensor::allclose(&xs, &out, 1e-5, 1e-5, false), true);
         println!("✅ Success! RevIn module executed successfully!");
@@ -833,7 +825,7 @@ mod tests {
         let xs = Tensor::randn(&[2, 512, 1024], (Kind::Float, *DEVICE));
         let rev_in = RevIn::new(512, None, None, &DEVICE).unwrap();
         let (normalized, reverse_fn, _) = rev_in.forward(&xs, Some(true)).unwrap();
-        let out = reverse_fn(&normalized).unwrap();
+        let out = reverse_fn.unwrap()(&normalized.unwrap()).unwrap();
 
         assert_eq!(Tensor::allclose(&xs, &out, 1e-5, 1e-5, false), true);
         println!("✅ Success! RevIn module executed successfully!");
@@ -847,17 +839,17 @@ mod tests {
             .to_device(*DEVICE);
 
         let geglu = GEGLU;
-        let tensors = geglu.rearrange(&xs);
+        let (x, gate) = geglu.rearrange(&xs);
 
-        let x = Tensor::from_slice(&[1, 2, 5, 6])
+        let x_ = Tensor::from_slice(&[1, 2, 5, 6])
             .reshape(&[2, 2])
             .to_device(*DEVICE);
-        assert_eq!(tensors[0], x);
+        assert_eq!(x, x_);
 
-        let gate = Tensor::from_slice(&[3, 4, 7, 8])
+        let gate_ = Tensor::from_slice(&[3, 4, 7, 8])
             .reshape(&[2, 2])
             .to_device(*DEVICE);
-        assert_eq!(tensors[1], gate);
+        assert_eq!(gate, gate_);
         println!("✅ Success! GEGLU rearrange executed successfully!");
     }
 
@@ -1335,8 +1327,8 @@ mod tests {
         let vs = VarStore::new(Device::Cpu);
         let model = ITransformer::new(
             &(vs.root() / "itransformer"),
-            16,
-            24,
+            137,
+            96,
             6,
             256,
             Some(1),
@@ -1353,7 +1345,7 @@ mod tests {
             &DEVICE,
         )?;
 
-        let time_series = Tensor::randn([2, 24, 16], (Kind::Float, *DEVICE));
+        let time_series = Tensor::randn([2, 96, 137], (Kind::Float, *DEVICE));
         let preds = model.forward(&time_series, None, false);
 
         println!("{:?}", preds);
