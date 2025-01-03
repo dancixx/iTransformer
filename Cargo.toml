@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# candle-core = { version = "0.8", features = ["metal"] }
-# candle-ext = { git = "https://github.com/dancixx/candle-ext.git" }
-# candle-nn = { version = "0.8.1", features = ["metal"] }
 einops = { git = "https://github.com/VasanthakumarV/einops.git" }
 either = "1.13.0"
 tch = "0.18.1"
