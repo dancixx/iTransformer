@@ -37,14 +37,40 @@ To get started, ensure you have Rust and Cargo installed. Then:
 
 ```bash
 # Add iTransformer to your project dependencies
-soon...
+cargo add itransformer-rs
 ```
 
 ## 📝 **Usage**
 
 ```bash
-# Add iTransformer to your project dependencies
-soon...
+use tch::{Device, Tensor, nn::VarStore, Kind};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let vs = VarStore::new(Device::Cpu);
+    let model = ITransformer::new(
+        &(vs.root() / "itransformer"),
+        137, // num_variates
+        96,  // lookback_len
+        6,   // depth
+        256, // dim
+        Some(1),       // num_tokens_per_variate
+        vec![12, 24, 36, 48], // pred_length
+        Some(64),     // dim_head
+        Some(8),      // heads
+        None,         // attn_drop_p
+        None,         // ff_mult
+        None,         // ff_drop_p
+        None,         // num_mem_tokens
+        Some(true),   // use_reversible_instance_norm
+        None,         // reversible_instance_norm_affine
+        false,        // flash_attn
+        &Device::Cpu,
+    )?;
+    let time_series = Tensor::randn([2, 96, 137], (Kind::Float, Device::Cpu));
+    let preds = model.forward(&time_series, None, false);
+    println!("{:?}", preds);
+    Ok(())
+}
 ```
 
 
@@ -83,4 +109,3 @@ Contributions are welcome! Please follow the standard GitHub pull request proces
 ---
 
 This repository is a Rust adaptation of the cutting-edge iTransformer model, aiming to bring efficient and scalable time series forecasting capabilities to the Rust ecosystem.
-

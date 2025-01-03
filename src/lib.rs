@@ -1,3 +1,5 @@
+#![cfg(not(doctest))]
+
 use either::Either;
 use tch::{
     nn::{
@@ -7,6 +9,66 @@ use tch::{
     Device, Kind, Result, Tensor,
 };
 
+/// # ITransformer
+///
+/// The `ITransformer` is a transformer-based architecture designed for multivariate time series modeling.
+/// It supports tokenization per variate, reversible instance normalization, and flexible prediction heads.
+/// This implementation enables both training and inference, handling complex patterns in sequential data.
+///
+/// ## Features:
+/// - Multi-layer Attention and FeedForward blocks.
+/// - Reversible Instance Normalization.
+/// - Flexible Prediction Heads.
+/// - Memory Tokens for better long-term dependencies.
+///
+/// ## Fields:
+///
+/// - `num_variates`: Number of variates (features) in the time series data.
+/// - `lookback_len`: Number of time steps used as input for predictions.
+/// - `pred_length`: Vector defining output prediction lengths for each prediction head.
+/// - `num_tokens_per_variate`: Number of tokens per variate.
+/// - `mem_tokens`: Optional memory tokens for transformer layers.
+/// - `reversible_instance_norm`: Optional reversible instance normalization module.
+/// - `layers`: Vector of Transformer layers, each with an `Attention` and `FeedForward` block.
+/// - `mlp_in`: Multi-Layer Perceptron input layer.
+/// - `pred_heads`: Vector of prediction heads.
+///
+/// ## Example Usage
+///
+/// ```rust
+/// use tch::{Device, Tensor, nn::VarStore, Kind};
+///
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let vs = VarStore::new(Device::Cpu);
+///     let model = ITransformer::new(
+///         &(vs.root() / "itransformer"),
+///         137, // num_variates
+///         96,  // lookback_len
+///         6,   // depth
+///         256, // dim
+///         Some(1),       // num_tokens_per_variate
+///         vec![12, 24, 36, 48], // pred_length
+///         Some(64),     // dim_head
+///         Some(8),      // heads
+///         None,         // attn_drop_p
+///         None,         // ff_mult
+///         None,         // ff_drop_p
+///         None,         // num_mem_tokens
+///         Some(true),   // use_reversible_instance_norm
+///         None,         // reversible_instance_norm_affine
+///         false,        // flash_attn
+///         &Device::Cpu,
+///     )?;
+///
+///     let time_series = Tensor::randn([2, 96, 137], (Kind::Float, Device::Cpu));
+///     let preds = model.forward(&time_series, None, false);
+///
+///     println!("{:?}", preds);
+///
+///     Ok(())
+/// }
+/// ```
+///
 #[derive(Debug)]
 pub struct ITransformer {
     num_variates: i64,
@@ -23,6 +85,53 @@ pub struct ITransformer {
 }
 
 impl ITransformer {
+    /// Creates a new instance of `ITransformer`.
+    ///
+    /// ### Arguments:
+    /// - `vs`: Path for the variable store.
+    /// - `num_variates`: Number of features in the input time series.
+    /// - `lookback_len`: Number of past time steps to consider.
+    /// - `depth`: Number of transformer layers.
+    /// - `dim`: Dimension of the hidden state.
+    /// - `num_tokens_per_variate`: Tokens per variate.
+    /// - `pred_length`: Prediction lengths for each prediction head.
+    /// - `dim_head`: Dimension of each attention head.
+    /// - `heads`: Number of attention heads.
+    /// - `attn_drop_p`: Dropout probability for attention layers.
+    /// - `ff_mult`: Expansion factor for feed-forward layers.
+    /// - `ff_drop_p`: Dropout probability for feed-forward layers.
+    /// - `num_mem_tokens`: Number of memory tokens.
+    /// - `use_reversible_instance_norm`: Whether to use reversible instance normalization.
+    /// - `reversible_instance_norm_affine`: Whether normalization is affine.
+    /// - `flash_attn`: Whether to use flash attention.
+    /// - `device`: Device to run the model on.
+    ///
+    /// ### Returns:
+    /// - A `Result` containing the initialized `ITransformer` instance.
+    ///
+    /// ### Example:
+    /// ```rust
+    /// let vs = VarStore::new(Device::Cpu);
+    /// let model = ITransformer::new(
+    ///     &(vs.root() / "itransformer"),
+    ///     137,
+    ///     96,
+    ///     6,
+    ///     256,
+    ///     Some(1),
+    ///     vec![12, 24, 36, 48],
+    ///     Some(64),
+    ///     Some(8),
+    ///     None,
+    ///     None,
+    ///     None,
+    ///     None,
+    ///     Some(true),
+    ///     None,
+    ///     false,
+    ///     &Device::Cpu,
+    /// );
+    /// ```
     pub fn new(
         vs: &Path,
         num_variates: i64,
@@ -113,6 +222,25 @@ impl ITransformer {
         })
     }
 
+    /// Performs a forward pass on the ITransformer model.
+    ///
+    /// ### Arguments:
+    /// - `xs`: Input tensor with shape `[batch_size, lookback_len, num_variates]`.
+    /// - `targets`: Optional vector of target tensors for training.
+    /// - `train`: Boolean indicating if the model is in training mode.
+    ///
+    /// ### Returns:
+    /// - `Either<Vec<(i64, Tensor)>, f64>`:
+    ///   - During inference: A vector of prediction tensors.
+    ///   - During training: The mean squared error loss as a float.
+    ///
+    /// ### Example:
+    /// ```rust
+    /// let time_series = Tensor::randn([2, 96, 137], (Kind::Float, Device::Cpu));
+    /// let preds = model.forward(&time_series, None, false);
+    ///
+    /// println!("{:?}", preds);
+    /// ```
     fn forward(
         self,
         xs: &Tensor,

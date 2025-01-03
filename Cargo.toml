@@ -1,9 +1,8 @@
 [package]
-name = "iTransformer"
-version = "0.1.0"
+name = "itransformer-rs"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-einops = { git = "https://github.com/VasanthakumarV/einops.git" }
 either = "1.13.0"
 tch = "0.18.1"
