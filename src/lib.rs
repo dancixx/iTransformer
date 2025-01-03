@@ -118,95 +118,128 @@ impl ITransformer {
         })
     }
 
-    // fn forward(
-    //     &self,
-    //     xs: &Tensor,
-    //     targets: Option<&Vec<Tensor>>,
-    // ) -> Result<Either<Vec<(usize, Tensor)>, f64>> {
-    //     // einstein notation
-    //     // b: batch size
-    //     // n: time
-    //     // v: variate
-    //     // t: num tokens per variate
-    //     let t = self.num_tokens_per_variate;
-    //     let has_mem = self.mem_tokens.is_some();
-    //     assert_eq!(xs.dims()[1..], [self.lookback_len, self.num_variates]);
+    fn forward(
+        self,
+        xs: &Tensor,
+        targets: Option<&Vec<Tensor>>,
+        train: bool,
+    ) -> Result<Either<Vec<(i64, Tensor)>, f64>> {
+        // einstein notation
+        // b: batch size
+        // n: time
+        // v: variate
+        // t: num tokens per variate
+        let t = self.num_tokens_per_variate;
+        let has_mem = self.mem_tokens.is_some();
+        assert_eq!(xs.size()[1..], [self.lookback_len, self.num_variates]);
 
-    //     // einsum 'b n v -> b v n'
-    //     let xs = xs.transpose(1, 2)?;
-    //     let mut revin: Option<RevInResult> = None;
+        // einsum 'b n v -> b v n'
+        let xs = xs.permute(&[0, 2, 1]); // equivalent to xs.transpose(1, 2)
+        let mut revin = None;
 
-    //     if let Some(ref reversible_instance_norm) = &self.reversible_instance_norm {
-    //         let result = reversible_instance_norm.to_owned();
-    //         let result = result.forward(&xs, Some(false));
-    //         revin = Some(result);
-    //     };
+        if let Some(reversible_instance_norm) = &self.reversible_instance_norm {
+            let result = reversible_instance_norm.forward(&xs, Some(false))?;
+            revin = Some(result);
+        };
 
-    //     let (xs, reverse_fn, ..) = revin.unwrap()?;
-    //     let mut xs = self.mlp_in.forward(&xs)?;
-    //     let mut mem_ps = 0;
+        let (xs, reverse_fn, ..) = revin.unwrap();
+        let mut xs = self.mlp_in.forward(&xs);
+        let mut mem_ps = 0;
 
-    //     if has_mem {
-    //         let mem_tokens = self.mem_tokens.as_ref().unwrap();
-    //         let b = xs.dim(0)?; // batch-méret
-    //         let m = mem_tokens.dim(0)?;
-    //         let d = mem_tokens.dim(1)?;
+        if has_mem {
+            let mem_tokens = self.mem_tokens.as_ref().unwrap();
 
-    //         let repeated = mem_tokens
-    //             .unsqueeze(0)?
-    //             .repeat(&[b, 1, 1])?
-    //             .to_dtype(DType::F32)?;
-    //         mem_ps = repeated.dim(1)?;
-    //         xs = Tensor::cat(&[repeated, xs.clone()], 1)?;
-    //     }
+            // einsum m = repeat(self.mem_tokens, 'm d -> b m d', b = x.shape[0])
+            let b = xs.size()[0];
+            let mem_tokens = mem_tokens.unsqueeze(0).repeat(&[b, -1, -1]);
+            xs = Tensor::cat(&[&mem_tokens, &xs], 1);
+            mem_ps = mem_tokens.size()[1];
+        }
 
-    //     for (attn, ff) in &self.layers {
-    //         let (attn_out, ..) = attn.forward(&xs, self.mem_tokens.as_ref())?;
-    //         let xs_ = &xs + attn_out;
-    //         let xs_ = ff.forward(&xs_?)?;
-    //         xs = xs_
-    //     }
+        let mut first_values: Option<Tensor> = None;
+        // let xs = self.expand_streams(&xs)
 
-    //     if has_mem {
-    //         let b = xs.dim(1)?;
-    //         let total_tokens = xs.dim(1)?;
-    //         let d = xs.dim(2)?;
-    //         xs = xs.narrow(1, mem_ps, total_tokens - mem_ps)?;
-    //     }
+        for (attn, ff) in &self.layers {
+            let (attn_out, values) = attn.forward_t(&xs, first_values.as_ref(), train)?;
+            first_values = first_values.or(Some(values));
+            let xs_ = &xs + attn_out;
+            let xs_ = ff.forward_t(&xs_, train);
+            xs = xs_
+        }
 
-    //     if self.reversible_instance_norm.is_some() {
-    //         // einops 'b (n t) d -> t b n d
-    //         let xs_ = xs
-    //             .reshape(&[t, xs.dim(0)?, xs.dim(1)? / t, xs.dim(2)?])?
-    //             .transpose(0, 1)?;
-    //         let xs_ = reverse_fn(&xs_)?;
-    //         // einops 't b n d -> b (n t) d'
-    //         let xs_ = xs_
-    //             .transpose(0, 1)?
-    //             .reshape(&[xs.dim(1)?, xs.dim(2)? * t, xs.dim(3)?])?;
-    //         xs = xs_
-    //     }
+        // let xs = self.reduce_streams(&xs)
 
-    //     let mut preds = Vec::with_capacity(self.pred_heads.len());
-    //     for pred_head in &self.pred_heads {
-    //         let pred = pred_head.forward(&xs)?;
-    //         preds.push(pred);
-    //     }
+        if has_mem {
+            // _, x = unpack(x, mem_ps, 'b * d')
+            let splits = xs.split(mem_ps, 1);
+            xs = splits[1].shallow_clone();
+        }
 
-    //     if let Some(targets) = targets {
-    //         let mut mse_loss = 0.0;
-    //         for (target, pred) in targets.iter().zip(&preds) {
-    //             assert_eq!(target.dims(), pred.dims());
-    //             // mse_loss = mse_loss + (target - pred)?.powf(2.0)?.into_iter().sum()?;
-    //         }
+        if self.reversible_instance_norm.is_some() {
+            // einops 'b (n t) d -> t b n d
+            let xs_dims = xs.size();
+            let (b, nt, d) = (xs_dims[0], xs_dims[1], xs_dims[2]);
+            let n = nt / t;
 
-    //         Ok(Either::Right(mse_loss))
-    //     } else {
-    //         let result = self.pred_length.clone();
-    //         let result = result.into_iter().zip(preds).collect::<Vec<_>>();
-    //         Ok(Either::Left(result))
-    //     }
-    // }
+            // rearrange(x, 'b (n t) d -> t b n d', t = t)
+            let xs_ = xs.reshape(&[b, n, t, d]);
+            let xs_ = xs_.permute(&[2, 0, 1, 3]);
+            let xs_ = reverse_fn(&xs_)?;
+            // rearrange(x, 't b n d -> b (n t) d', t = t)
+            let xs_ = xs_.permute(&[1, 2, 0, 3]);
+            let xs_ = xs_.reshape(&[b, nt, d]);
+            xs = xs_;
+        }
+
+        let mut preds = Vec::with_capacity(self.pred_heads.len());
+        for pred_head in &self.pred_heads {
+            let pred = pred_head.forward(&xs);
+            preds.push(pred);
+        }
+
+        if let Some(targets) = targets {
+            assert_eq!(
+                targets.len(),
+                preds.len(),
+                "Mismatch between targets and predictions"
+            );
+
+            if train {
+                let mut mse_loss = 0.0;
+
+                for (target, pred) in targets.iter().zip(&preds) {
+                    assert_eq!(
+                        target.size(),
+                        pred.size(),
+                        "Target and prediction shape mismatch"
+                    );
+
+                    let loss = Tensor::mse_loss(target, pred, tch::Reduction::Mean);
+                    mse_loss += loss.double_value(&[]);
+                }
+
+                return Ok(Either::Right(mse_loss));
+            } else {
+                panic!("Targets provided, but model is not in training mode");
+            }
+        }
+
+        // Handle inference (no targets)
+        if preds.is_empty() {
+            return Ok(Either::Left(vec![(
+                self.pred_length[0],
+                preds[0].shallow_clone(),
+            )]));
+        }
+
+        let result = self
+            .pred_length
+            .clone()
+            .into_iter()
+            .zip(preds)
+            .collect::<Vec<_>>();
+        Ok(Either::Left(result))
+    }
 }
 
 #[derive(Debug)]
@@ -721,12 +754,12 @@ impl RevIn {
     }
 
     fn forward(
-        self,
+        &self,
         xs: &Tensor,
         return_statistics: Option<bool>,
     ) -> Result<(
         Tensor,
-        Box<dyn FnOnce(&Tensor) -> Result<Tensor>>,
+        Box<dyn FnOnce(&Tensor) -> Result<Tensor> + '_>,
         Option<Statistics>,
     )> {
         assert_eq!(xs.size()[1] == self.num_variants, true);
@@ -757,8 +790,8 @@ impl RevIn {
             statistics = Some(Statistics {
                 mean,
                 var,
-                gamma: self.gamma,
-                beta: self.beta,
+                gamma: self.gamma.copy(),
+                beta: self.beta.copy(),
             });
         }
 
@@ -1297,34 +1330,34 @@ mod tests {
         println!("Output Tensor: {:?}", output);
     }
 
-    // #[test]
-    // fn test_itransformer() -> Result<()> {
-    //     let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &DEVICE);
-    //     let model = ITransformer::new(
-    //         &vb,
-    //         16,
-    //         24,
-    //         6,
-    //         256,
-    //         Some(1),
-    //         vec![12, 24, 36, 48],
-    //         Some(64),
-    //         Some(8),
-    //         None,
-    //         None,
-    //         None,
-    //         None,
-    //         Some(true),
-    //         None,
-    //         false,
-    //         &DEVICE
-    //     )?;
-    //
-    //     let time_series = Tensor::randn(0.0f32, 1.0f32, (2, 24, 16), &DEVICE)?.to_dtype(DType::F32)?;
-    //     let preds = model.forward(&time_series, None)?;
-    //
-    //     println!("{:?}", preds);
-    //
-    //     Ok(())
-    // }
+    #[test]
+    fn test_itransformer() -> Result<()> {
+        let vs = VarStore::new(Device::Cpu);
+        let model = ITransformer::new(
+            &(vs.root() / "itransformer"),
+            16,
+            24,
+            6,
+            256,
+            Some(1),
+            vec![12, 24, 36, 48],
+            Some(64),
+            Some(8),
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            false,
+            &DEVICE,
+        )?;
+
+        let time_series = Tensor::randn([2, 24, 16], (Kind::Float, *DEVICE));
+        let preds = model.forward(&time_series, None, false);
+
+        println!("{:?}", preds);
+
+        Ok(())
+    }
 }
